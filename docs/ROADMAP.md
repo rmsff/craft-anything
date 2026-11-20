@@ -2484,6 +2484,7 @@ to the project next.
       closed dialog
       — claimed: AlexJoaquimPereira, branch bugfix/r2.10-pin-estimate-project
 - [ ] Opening a pin that's already running brings its window to the front, instead of a message
+      — claimed: rmsff, branch feature/r2.10-pin-to-front
 - [x] How much space pins take in Settings
       — claimed: Afloat16, branch feature/r2.10-pinned-copy-storage
 
