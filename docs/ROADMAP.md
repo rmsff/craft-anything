@@ -2497,7 +2497,7 @@ to the project next.
       in a toast with the size (`a_shared_file_that_cannot_be_linked_is_counted_as_copied`)
       — in PR #220
 - [ ] Pins of one project sharing with each other, so a third frozen copy of the same assets
-      takes no more space
+      takes no more space — claimed: rmsff, branch feature/r2.10-pins-share-assets
 - [x] Pin a website (a frozen copy of the built site, each served on its own port): a pin copies
       the built site alone (a light one shares its media), and opening it serves that copy on a
       free loopback port of its own until it's closed; a served pin isn't removed
