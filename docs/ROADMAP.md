@@ -2465,7 +2465,7 @@ to the project next.
       — in PR #220
 - [ ] Pins of one project sharing with each other, so a third frozen copy of the same assets
       takes no more space
-- [ ] Pin a website (a frozen copy of the built site, each served on its own port)
+- [ ] Pin a website (a frozen copy of the built site, each served on its own port) — claimed: rmsff, branch feature/r2.10-pin-website
 - [ ] A pin started before the app restarted shows as running (keep its process id and start
       time in the pin, and check both), and can be stopped
 - [x] Cap a run's log (`last-run.log`, `play.log`): it grows as long as the program prints. The
