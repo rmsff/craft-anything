@@ -605,6 +605,9 @@ pub struct ProjectUsage {
     pub api_billed_usd: f64,
     /// Some of it came with a price; agents that report none leave tokens only.
     pub priced: bool,
+    /// Counting started again after an unreadable record was set aside ([`ProjectUsage::reset`]),
+    /// so the builds before then aren't in these figures.
+    pub restarted: bool,
 }
 
 /// What a project's runs did, line by line; the run is its only writer.
@@ -614,6 +617,8 @@ pub const ACTIVITY_LOG_OLD: &str = "build-activity.old.log";
 
 /// Where [`ProjectUsage`] is kept in the project folder.
 pub const USAGE_FILE: &str = "usage.json";
+/// Where [`ProjectUsage::reset`] moves an unreadable [`USAGE_FILE`], kept for the person to look at.
+pub const USAGE_SET_ASIDE: &str = "usage.unreadable.json";
 pub const USAGE_VERSION: u32 = 1;
 /// A build's turn and a question can record their cost at the same time. The save is
 /// read-modify-write, so both go through one lock or one would overwrite the other.
@@ -663,7 +668,8 @@ impl ProjectUsage {
     pub fn update(root: &Path, f: impl FnOnce(&mut ProjectUsage)) -> Result<(), ToolError> {
         let _updating = USAGE_UPDATE.lock().unwrap_or_else(PoisonError::into_inner);
         let Some(mut u) = ProjectUsage::read(root).known() else {
-            return Err(ToolError::invalid(format!("{USAGE_FILE} couldn't be read, so it isn't changed.")));
+            return Err(ToolError::invalid(format!("{USAGE_FILE} couldn't be read, so it isn't changed."))
+                .with_remediation(format!("Set it aside and start counting again with {}.", crate::tools::project_tools::USAGE_RESET_TOOL)));
         };
         if u.version > USAGE_VERSION {
             return Err(ToolError::unsupported(format!("{USAGE_FILE} was written by a newer Craft Anything, so it isn't changed.")));
@@ -672,6 +678,27 @@ impl ProjectUsage {
         u.version = USAGE_VERSION;
         let json = serde_json::to_vec_pretty(&u).map_err(|e| ToolError::internal(e.to_string()))?;
         write_atomic(&root.join(USAGE_FILE), &json)
+    }
+
+    /// Set an unreadable usage.json aside as [`USAGE_SET_ASIDE`] and start counting again, so the
+    /// project's runs are counted once more. A readable file is never replaced. The new record is
+    /// `restarted`, and its token counts are lower bounds, since what the old one held isn't known.
+    pub fn reset(root: &Path) -> Result<PathBuf, ToolError> {
+        let _updating = USAGE_UPDATE.lock().unwrap_or_else(PoisonError::into_inner);
+        if !ProjectUsage::read(root).is_unreadable() {
+            return Err(ToolError::invalid(format!("{USAGE_FILE} can be read, so it isn't set aside.")));
+        }
+        let aside = root.join(USAGE_SET_ASIDE);
+        // A rename replaces the target on Unix, and an earlier set-aside record is the only copy of what it held.
+        if std::fs::symlink_metadata(&aside).is_ok() {
+            return Err(ToolError::invalid(format!("{USAGE_SET_ASIDE} is already there from an earlier record, so this one isn't set aside over it."))
+                .with_remediation(format!("Move {USAGE_SET_ASIDE} out of the project folder, then try again.")));
+        }
+        std::fs::rename(root.join(USAGE_FILE), &aside).map_err(|e| ToolError::io(root.join(USAGE_FILE).display(), e))?;
+        let fresh = ProjectUsage { version: USAGE_VERSION, tokens_incomplete: true, restarted: true, ..ProjectUsage::default() };
+        let json = serde_json::to_vec_pretty(&fresh).map_err(|e| ToolError::internal(e.to_string()))?;
+        write_atomic(&root.join(USAGE_FILE), &json)?;
+        Ok(aside)
     }
 
     /// One agent turn's tokens and reported cost (a price that isn't a sensible number is skipped).
@@ -1105,6 +1132,7 @@ pub const OWN_NAMES: &[&str] = &[
     crate::feed::FEED_FILE,
     crate::questions::QUESTIONS_FILE,
     USAGE_FILE,
+    USAGE_SET_ASIDE,
     ACTIVITY_LOG,
     ACTIVITY_LOG_OLD,
     ASSETS,
@@ -1663,6 +1691,48 @@ mod tests {
         std::fs::write(dir.path().join(USAGE_FILE), br#"{"version":1,"cost_usd":2.0,"priced":true}"#).unwrap();
         let UsageRead::Known(u) = ProjectUsage::read(dir.path()) else { panic!("a readable file is known") };
         assert_eq!((u.cost_usd, u.priced), (2.0, true));
+    }
+
+    /// R5.3: an unreadable usage.json stopped every count. Setting it aside keeps it and starts a
+    /// record that counts again, marked as leaving out what came before; a readable one is kept.
+    #[test]
+    fn an_unreadable_usage_file_is_set_aside_and_counting_starts_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert!(ProjectUsage::reset(root).is_err(), "no file: nothing to set aside");
+        assert!(!root.join(USAGE_SET_ASIDE).exists());
+
+        std::fs::write(root.join(USAGE_FILE), b"{ not json").unwrap();
+        let refused = ProjectUsage::update(root, |u| u.work_ms = 1).unwrap_err();
+        assert!(refused.remediation.as_deref().is_some_and(|r| r.contains(crate::tools::project_tools::USAGE_RESET_TOOL)), "{refused:?}");
+
+        assert_eq!(ProjectUsage::reset(root).unwrap(), root.join(USAGE_SET_ASIDE));
+        assert_eq!(std::fs::read(root.join(USAGE_SET_ASIDE)).unwrap(), b"{ not json", "kept as it was");
+        let fresh = ProjectUsage::read(root).known().unwrap();
+        assert!(fresh.restarted && fresh.tokens_incomplete && !fresh.priced && fresh.work_ms == 0, "{fresh:?}");
+        ProjectUsage::update(root, |u| {
+            u.work_ms += 1_000;
+            u.add_turn(100, 10, Some(0.4), false);
+        })
+        .unwrap();
+        let u = ProjectUsage::read(root).known().unwrap();
+        assert_eq!((u.work_ms, u.tokens(), u.cost_usd, u.restarted), (1_000, 110, 0.4, true), "counted again, still marked");
+
+        // A readable record is never set aside, and an earlier set-aside one is never replaced.
+        let before = std::fs::read(root.join(USAGE_FILE)).unwrap();
+        assert!(ProjectUsage::reset(root).is_err());
+        assert_eq!(std::fs::read(root.join(USAGE_FILE)).unwrap(), before);
+        std::fs::write(root.join(USAGE_FILE), b"").unwrap();
+        let again = ProjectUsage::reset(root).unwrap_err();
+        assert!(again.message.contains(USAGE_SET_ASIDE), "{again:?}");
+        assert_eq!(std::fs::read(root.join(USAGE_SET_ASIDE)).unwrap(), b"{ not json");
+        assert_eq!(std::fs::read(root.join(USAGE_FILE)).unwrap(), b"", "left as it was");
+
+        // A folder where the file should be is moved aside too.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(USAGE_FILE)).unwrap();
+        ProjectUsage::reset(dir.path()).unwrap();
+        assert!(dir.path().join(USAGE_SET_ASIDE).is_dir() && dir.path().join(USAGE_FILE).is_file());
     }
 
     /// A build turn and a question can save their cost together: neither may overwrite the other.

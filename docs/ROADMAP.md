@@ -423,10 +423,15 @@ Every round spends the person's money or quota. One that can't do anything shoul
       missing file, bad JSON, an empty file, a folder, an oversized file, no read permission (Unix),
       a valid file, the tool result and the screen's words
       — claimed: tanish2k09, branch bugfix/r5.3-unreadable-usage
-- [ ] An unreadable `usage.json` now stops a project's usage from being counted at all (every
-      update is refused and logged). Say so where the person can act on it, for example offer to
-      set the file aside and start counting again
-      — claimed: rmsff, branch bugfix/r5.3-unreadable-usage-json
+- [x] An unreadable `usage.json` stopped a project's usage from being counted at all (every
+      update was refused and logged). The project screen now says builds aren't counted while it
+      can't be read and offers "Set it aside and count again" (`project_usage_reset`, also named
+      by `project_show`'s `usage_note` and the refused update's remediation): the file is kept as
+      `usage.unreadable.json`, a new record counts later runs, and it is marked `restarted`, so
+      its time and cost show as "at least …" and its tokens as a lower bound, never as the whole.
+      A readable record, or one already set aside, is never replaced. Unit tests of the move, the
+      tool and the screen's words
+      — PR #2212; claimed: rmsff, branch bugfix/r5.3-unreadable-usage-json
 - [x] Show what the last run used next to Try again. `usage.json` keeps project totals only
       (time, tokens, `cost_usd`, `api_billed_usd`); the activity log has each turn's tokens but
       no cost, since a resumed agent's figure can't be tied to one turn (`activity.rs`). Show

@@ -3043,6 +3043,34 @@ fn a_big_cost_doesnt_paint_over_its_caption() {
     assert!(!caption.intersects(value), "{caption:?} and {value:?}");
 }
 
+/// R5.3: an unreadable usage record stops every count; the project says so and sets it aside.
+#[test]
+fn an_unreadable_usage_record_is_set_aside_from_the_project_and_counted_again() {
+    use craft_anything_engine::workspace::{TargetRef, USAGE_FILE, USAGE_SET_ASIDE, Workspace};
+    let d = tempfile::tempdir().unwrap();
+    // A real project folder: the tool opens it.
+    let root = Workspace::create(d.path(), "Snake", "A snake game", TargetRef::None).unwrap().root;
+    std::fs::write(root.join(USAGE_FILE), b"{ not json").unwrap();
+    let r = root.clone();
+    let mut h = harness(move || {
+        let mut a = demo::app(demo::engine(Mode::Beginner, true));
+        demo::fill_project(&mut a);
+        if let Some(ws) = a.workspace.as_mut() {
+            ws.root = r.clone();
+        }
+        a
+    });
+    h.run_steps(3);
+    h.get_by_label("Builds aren't counted while this record can't be read.");
+    h.get_by_label("Set it aside and count again").click();
+    assert!(wait(&mut h, |a| a.usage.get(&root).is_some_and(|u| !u.unreadable)));
+    assert_eq!(std::fs::read(root.join(USAGE_SET_ASIDE)).unwrap(), b"{ not json");
+    h.run_steps(2);
+    assert!(h.query_by_label("Set it aside and count again").is_none());
+    h.get_by_label("Time spent");
+    assert!(h.get_all_by_label("Unknown").count() >= 2, "what came before isn't known");
+}
+
 #[test]
 fn ghidras_memory_is_automatic_until_the_person_sets_it() {
     let mut h = harness_sized(egui::vec2(1280.0, 1000.0), || {

@@ -77,6 +77,7 @@ const ACTIONS: &[Action] = &[
     a("add_pictures",        "pictures of the original for the builder",       Tool(&["rebuild_start"])),
     a("attach",              "attach pictures to the next message",            Pending { tool: None, why: "rebuild_note and rebuild_start take text; attachments with a message come next" }),
     a("paste_pictures",      "attach pictures from the clipboard (Ctrl+V)",    UiOnly("the clipboard belongs to the app; headless callers name picture files")),
+    a("reset_usage",         "set an unreadable usage record aside and count a project's builds again", Tool(&["project_usage_reset"])),
     a("raise_asset_budget",  "give a project another default budget for generated assets", Tool(&["project_assets_budget"])),
     a("set_generate_assets", "let a game's builder generate pictures and 3D models, or not", Tool(&["project_assets_allow"])),
     a("Project › Open folder", "show the project folder in the file manager",  Tool(&["project_open_folder"])),

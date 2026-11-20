@@ -14,6 +14,7 @@ use craft_anything_ai::rebuild::feed::{self, apply};
 use craft_anything_ai::rebuild::{self, AppKind, KindRegistry, KindWords, Note, RebuildRun, RunEvent, RunOptions, Started, Step, Stopped, TargetKind};
 use craft_anything_engine::inbox::{Answer, Inbox, Request, RequestKind};
 use craft_anything_engine::outputs::CargoEnv;
+use craft_anything_engine::tools::project_tools::USAGE_RESET_TOOL;
 use craft_anything_engine::workspace::{CheckResult, Status, TargetRef, Workspace, suggest_name};
 use egui::{Color32, RichText, Ui, Vec2};
 use std::path::{Path, PathBuf};
@@ -862,6 +863,31 @@ impl CraftApp {
         self.act("project_assets_budget", params, tr("Raise the asset budget"));
     }
 
+    /// Set a project's unreadable usage record aside so its builds are counted again, through the
+    /// project_usage_reset tool.
+    fn reset_usage(&mut self, root: &Path) {
+        self.act(USAGE_RESET_TOOL, serde_json::json!({"project": root}), tr("Count the usage again"));
+    }
+
+    /// After project_usage_reset: read the new record, or say why it wasn't set aside.
+    pub(crate) fn usage_reset(&mut self, result: Result<serde_json::Value, craft_anything_engine::evidence::ToolError>) {
+        match result {
+            Ok(v) => {
+                if let Some(root) = v["project"].as_str().map(PathBuf::from)
+                    && let Some(clock) = self.usage.get_mut(&root)
+                {
+                    let working = clock.working();
+                    clock.saved_again(&root, working);
+                }
+                self.toast(tr("Set aside as usage.unreadable.json. Builds are counted again from now."), false);
+            }
+            Err(e) => {
+                let why = tr("Couldn't set the usage record aside.");
+                self.toast(format!("{why} {}", e.for_people()), true);
+            }
+        }
+    }
+
     /// After project_assets_budget or project_assets_allow: show the project's new settings.
     pub(crate) fn assets_changed(&mut self) {
         if let Some(ws) = self.workspace.as_mut() {
@@ -1013,7 +1039,9 @@ fn side(app: &mut CraftApp, ui: &mut Ui, ws: &Workspace) {
         outcome_button(app, ui, ws, theme::ControlSize::Medium, true);
     }
     ui.add_space(theme::space::LG);
-    steps(app, ui, ws);
+    if steps(app, ui, ws) {
+        app.reset_usage(&ws.root);
+    }
     ui.add_space(theme::space::LG);
     open_questions(app, ui);
     if craft_anything_engines::game::Builder::from_stack(&m.stack).is_some() {
@@ -1130,8 +1158,11 @@ fn open_questions(app: &CraftApp, ui: &mut Ui) {
     ui.add_space(theme::space::LG);
 }
 
-fn steps(app: &CraftApp, ui: &mut Ui, ws: &Workspace) {
+/// The project's progress and usage; true when the person asked to set an unreadable usage
+/// record aside.
+fn steps(app: &CraftApp, ui: &mut Ui, ws: &Workspace) -> bool {
     let t = Tokens::get(ui.ctx());
+    let mut reset_usage = false;
     let current = current_step(app, ws);
     let live = current.is_some_and(|(_, live)| live);
     let idx = current.and_then(|(c, _)| Step::ALL.iter().position(|s| *s == c));
@@ -1236,6 +1267,21 @@ fn steps(app: &CraftApp, ui: &mut Ui, ws: &Workspace) {
             if let Some(usage) = u.tokens() {
                 widgets::stat_row(ui, "Tokens", &usage).on_hover_text(tip());
             }
+            // Said where it can be fixed: until then no run adds to the record.
+            if u.unreadable {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(tr("Builds aren't counted while this record can't be read."))
+                            .color(t.text_faint)
+                            .size(theme::CAPTION)
+                            .line_height(Some(theme::leading(theme::CAPTION))),
+                    )
+                    .wrap(),
+                );
+                reset_usage = widgets::link(ui, &tr("Set it aside and count again")).on_hover_text(tr(
+                    "Moves usage.json aside as usage.unreadable.json in the project folder and starts a new record. Builds from now on are counted; earlier ones aren't included.",
+                )).clicked();
+            }
             if u.working() {
                 ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
             }
@@ -1249,6 +1295,7 @@ fn steps(app: &CraftApp, ui: &mut Ui, ws: &Workspace) {
             ui.painter().rect_filled(filled, 2.0, t.accent);
         }
     });
+    reset_usage
 }
 
 fn feed(app: &mut CraftApp, ui: &mut Ui, ws: &Workspace, waiting: &[Note]) {
