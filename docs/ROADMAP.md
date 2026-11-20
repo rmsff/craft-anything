@@ -426,6 +426,7 @@ Every round spends the person's money or quota. One that can't do anything shoul
 - [ ] An unreadable `usage.json` now stops a project's usage from being counted at all (every
       update is refused and logged). Say so where the person can act on it, for example offer to
       set the file aside and start counting again
+      — claimed: rmsff, branch bugfix/r5.3-unreadable-usage-json
 - [x] Show what the last run used next to Try again. `usage.json` keeps project totals only
       (time, tokens, `cost_usd`, `api_billed_usd`); the activity log has each turn's tokens but
       no cost, since a resumed agent's figure can't be tied to one turn (`activity.rs`). Show
