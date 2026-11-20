@@ -2161,6 +2161,7 @@ Gaps found while using the app for real projects.
       — claimed: monarchsofchaos004-gif, branch docs/readme-zh-hant; PR #926
 - [ ] macOS: an Edit menu (Undo, Cut, Copy, Paste, Select All). The keys work in text boxes, but
       the system's Edit items need the text box to answer them, so they'd show greyed out today
+      — claimed: rmsff, branch feature/r2.9-edit-menu
 - [x] The Advanced console's prompt box starts tall enough to read what's typed (#942)
       — claimed: justinjohn0306, branch bugfix/942-console-input-height
 - [x] A French README (`README.fr.md`) translated from `README.md` and linked from the language
