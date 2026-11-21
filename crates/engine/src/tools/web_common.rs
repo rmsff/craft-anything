@@ -417,6 +417,20 @@ pub fn pick_target<'a>(targets: &'a [Value], target_id: Option<&str>, want_kind:
     })
 }
 
+impl Browser {
+    /// The page a browser tool works on: `target_id`, else the study tab, else the first page. In
+    /// the person's own browser only the study tab: another of their tabs is refused, never read.
+    pub fn page_target<'a>(&self, targets: &'a [Value], target_id: Option<&str>) -> Result<&'a Value, ToolError> {
+        if let (Some(tab), Some(id)) = (self.tab.as_deref(), target_id)
+            && id != tab
+        {
+            return Err(ToolError::invalid(format!("{id:?} is another tab of your own browser; only the study tab is looked at"))
+                .with_remediation("Leave out target_id to use the study tab, or close the study with web_site_close first."));
+        }
+        pick_target(targets, target_id.or(self.tab.as_deref()), Some("page"))
+    }
+}
+
 /// Connect a page/renderer target's WebSocket and build a JSON-RPC client.
 pub fn connect_target(browser: &Browser, target: &Value, max_message: usize, dl: &Deadline) -> Result<CdpClient, ToolError> {
     let ws_url = target.get("webSocketDebuggerUrl").and_then(Value::as_str).ok_or_else(|| {

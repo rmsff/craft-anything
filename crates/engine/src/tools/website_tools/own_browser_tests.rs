@@ -14,6 +14,8 @@ struct Seen {
     tabs_connected: Vec<String>,
     created: bool,
     closed: Vec<String>,
+    /// Refuse to close tabs, as a browser that stopped answering would.
+    refuse_close: bool,
 }
 
 fn own_browser() -> (String, Arc<Mutex<Seen>>) {
@@ -89,9 +91,13 @@ fn serve_ws(stream: &mut TcpStream, path: &str, seen: &Mutex<Seen>) {
             s.browser_calls.push(method.clone());
             match method.as_str() {
                 "Target.createTarget" => s.created = true,
-                "Target.closeTarget" => s.closed.push(req["params"]["targetId"].as_str().unwrap_or_default().to_string()),
+                "Target.closeTarget" if !s.refuse_close => s.closed.push(req["params"]["targetId"].as_str().unwrap_or_default().to_string()),
                 _ => {}
             }
+        }
+        if method == "Target.closeTarget" && seen.lock().unwrap().refuse_close {
+            ws_write(stream, &json!({"id": req["id"], "error": {"code": -32000, "message": "busy"}}).to_string());
+            continue;
         }
         let result = match method.as_str() {
             "Target.createTarget" => json!({"targetId": "NEW1"}),
@@ -173,6 +179,37 @@ fn a_study_in_the_persons_browser_uses_and_closes_its_own_tab() {
     assert!(s.browser_calls.contains(&"Target.createTarget".to_string()), "{:?}", s.browser_calls);
     assert_eq!(s.closed, ["NEW1"], "only our tab is closed");
     assert!(!s.tabs_connected.is_empty() && s.tabs_connected.iter().all(|t| t == "NEW1"), "the person's tab was read: {:?}", s.tabs_connected);
+}
+
+/// In the person's browser no tool reaches their other tabs, even when named, and nothing is set
+/// that would reach them (blocking downloads holds for the whole browser).
+#[test]
+fn the_persons_other_tabs_are_out_of_reach() {
+    let (endpoint, seen) = own_browser();
+    let e = engine();
+    call(&e, "web_site_open", json!({"url": "https://app.test/home", "cdp_endpoint": endpoint, "settle_ms": 0, "timeout_secs": 20})).unwrap();
+    for tool in ["web_page_screenshot_take", "web_page_show", "web_coverage_measure"] {
+        let err = call(&e, tool, json!({"target_id": "PAGE1"})).unwrap_err();
+        assert!(err.message.contains("another tab of your own browser"), "{tool}: {err:?}");
+    }
+    let err = call(&e, "web_walkthrough_record", json!({"actions": [{"kind": "goto", "url": "https://app.test/"}], "capture": {"events": ["downloads"]}}))
+        .unwrap_err();
+    assert!(err.message.contains("downloads"), "{err:?}");
+    let s = seen.lock().unwrap();
+    assert!(s.tabs_connected.iter().all(|t| t == "NEW1"), "the person's tab was read: {:?}", s.tabs_connected);
+}
+
+/// A close the browser refuses leaves the study open, so trying again closes the tab.
+#[test]
+fn a_study_tab_that_wont_close_can_be_closed_again() {
+    let (endpoint, seen) = own_browser();
+    let e = engine();
+    call(&e, "web_site_open", json!({"url": "https://app.test/home", "cdp_endpoint": endpoint, "settle_ms": 0, "timeout_secs": 20})).unwrap();
+    seen.lock().unwrap().refuse_close = true;
+    assert!(call(&e, "web_site_close", json!({})).is_err(), "a failed close isn't reported as closed");
+    seen.lock().unwrap().refuse_close = false;
+    assert_eq!(call(&e, "web_site_close", json!({})).unwrap()["result"]["closed"], true);
+    assert_eq!(seen.lock().unwrap().closed, ["NEW1"]);
 }
 
 /// Only a loopback endpoint the person gave is used: another computer or a name is refused

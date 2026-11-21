@@ -23,6 +23,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 pub fn specs() -> Vec<ToolSpec> {
@@ -93,13 +94,15 @@ pub struct SiteBrowser {
     pub sign_in_revision: Option<String>,
     /// The tab we opened in the person's own browser; `None`: the browser is our private one.
     pub own_tab: Option<String>,
+    /// `web_site_close` closed that tab already.
+    tab_closed: AtomicBool,
     _owner: Mutex<Browser>,
 }
 
 impl Drop for SiteBrowser {
     // The person's browser and their other tabs stay as they were: only our own tab is closed.
     fn drop(&mut self) {
-        if let Some(id) = &self.own_tab {
+        if let Some(id) = self.own_tab.as_ref().filter(|_| !self.tab_closed.load(Ordering::SeqCst)) {
             let dl = Deadline::new(Duration::from_secs(3), crate::tool::CancelToken::default());
             if let Err(e) = browser_call(&self.endpoint, "Target.closeTarget", json!({"targetId": id}), &dl) {
                 log::warn!("couldn't close the study tab in your browser: {}", e.message);
@@ -228,6 +231,7 @@ fn web_site_open(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolErr
                 signed_in: want.clone(),
                 sign_in_revision: revision,
                 own_tab: None,
+                tab_closed: AtomicBool::new(false),
                 _owner: Mutex::new(b),
             });
             ctx.session.ext.insert(site.clone());
@@ -400,6 +404,7 @@ fn own_tab(ep: &Endpoint, dl: &Deadline) -> Result<SiteBrowser, ToolError> {
         signed_in: None,
         sign_in_revision: None,
         own_tab: Some(id.to_string()),
+        tab_closed: AtomicBool::new(false),
     })
 }
 
@@ -1445,6 +1450,16 @@ pub struct CloseParams {}
 
 fn web_site_close(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError> {
     let _: CloseParams = parse_params(params)?;
+    // The study tab in the person's browser is closed before it's let go, so a close that fails
+    // says so and can be tried again, instead of leaving the tab open behind a "closed".
+    if let Some(site) = ctx.session.ext.get::<SiteBrowser>()
+        && let Some(id) = &site.own_tab
+    {
+        let dl = Deadline::new(Duration::from_secs(5), ctx.cancel.clone());
+        browser_call(&site.endpoint, "Target.closeTarget", json!({"targetId": id}), &dl)
+            .map_err(|e| e.with_remediation("The study tab is still open in your browser: try web_site_close again, or close the tab yourself."))?;
+        site.tab_closed.store(true, Ordering::SeqCst);
+    }
     let closed = ctx.session.ext.remove::<SiteBrowser>().is_some();
     Ok(ToolOutput::Value(json!({"closed": closed})))
 }
