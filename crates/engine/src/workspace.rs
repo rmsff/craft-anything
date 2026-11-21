@@ -657,6 +657,11 @@ impl ProjectUsage {
     /// any other failure, or a file that doesn't parse, is [`UsageRead::Unreadable`].
     pub fn read(root: &Path) -> UsageRead {
         match read_file_capped(&root.join(USAGE_FILE), MAX_USAGE_BYTES) {
+            // A reset stopped between setting the record aside and starting the new one: counting
+            // has started again all the same, so it isn't a record of everything.
+            Err(e) if e.code == ErrorCode::NotFound && std::fs::symlink_metadata(root.join(USAGE_SET_ASIDE)).is_ok() => {
+                UsageRead::Known(ProjectUsage::restarted())
+            }
             Err(e) if e.code == ErrorCode::NotFound => UsageRead::None,
             Err(_) => UsageRead::Unreadable,
             Ok(bytes) => serde_json::from_slice(&bytes).map_or(UsageRead::Unreadable, UsageRead::Known),
@@ -688,17 +693,29 @@ impl ProjectUsage {
         if !ProjectUsage::read(root).is_unreadable() {
             return Err(ToolError::invalid(format!("{USAGE_FILE} can be read, so it isn't set aside.")));
         }
-        let aside = root.join(USAGE_SET_ASIDE);
-        // A rename replaces the target on Unix, and an earlier set-aside record is the only copy of what it held.
-        if std::fs::symlink_metadata(&aside).is_ok() {
-            return Err(ToolError::invalid(format!("{USAGE_SET_ASIDE} is already there from an earlier record, so this one isn't set aside over it."))
-                .with_remediation(format!("Move {USAGE_SET_ASIDE} out of the project folder, then try again.")));
+        let (usage, aside) = (root.join(USAGE_FILE), root.join(USAGE_SET_ASIDE));
+        let already = || {
+            ToolError::invalid(format!("{USAGE_SET_ASIDE} is already there from an earlier record, so this one isn't set aside over it."))
+                .with_remediation(format!("Move {USAGE_SET_ASIDE} out of the project folder, then try again."))
+        };
+        // An earlier set-aside record is the only copy of what it held, and another Craft Anything
+        // may be setting this one aside too: a hard link is made only where nothing is, so neither
+        // ever replaces it (a rename would, on Unix). The new record then replaces usage.json.
+        match std::fs::hard_link(&usage, &aside) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Err(already()),
+            // A drive without hard links: checked, then moved.
+            Err(_) if std::fs::symlink_metadata(&aside).is_ok() => return Err(already()),
+            Err(_) => std::fs::rename(&usage, &aside).map_err(|e| ToolError::io(usage.display(), e))?,
         }
-        std::fs::rename(root.join(USAGE_FILE), &aside).map_err(|e| ToolError::io(root.join(USAGE_FILE).display(), e))?;
-        let fresh = ProjectUsage { version: USAGE_VERSION, tokens_incomplete: true, restarted: true, ..ProjectUsage::default() };
-        let json = serde_json::to_vec_pretty(&fresh).map_err(|e| ToolError::internal(e.to_string()))?;
-        write_atomic(&root.join(USAGE_FILE), &json)?;
+        let json = serde_json::to_vec_pretty(&ProjectUsage::restarted()).map_err(|e| ToolError::internal(e.to_string()))?;
+        write_atomic(&usage, &json)?;
         Ok(aside)
+    }
+
+    /// A record counted again from now: earlier use isn't in it, so its tokens are a lower bound.
+    fn restarted() -> ProjectUsage {
+        ProjectUsage { version: USAGE_VERSION, tokens_incomplete: true, restarted: true, ..ProjectUsage::default() }
     }
 
     /// One agent turn's tokens and reported cost (a price that isn't a sensible number is skipped).
@@ -1733,6 +1750,16 @@ mod tests {
         std::fs::create_dir(dir.path().join(USAGE_FILE)).unwrap();
         ProjectUsage::reset(dir.path()).unwrap();
         assert!(dir.path().join(USAGE_SET_ASIDE).is_dir() && dir.path().join(USAGE_FILE).is_file());
+
+        // Stopped between setting the record aside and writing the new one: what's counted next
+        // is still marked as leaving out what came before.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(USAGE_SET_ASIDE), b"{ not json").unwrap();
+        let u = ProjectUsage::read(dir.path()).known().unwrap();
+        assert!(u.restarted && u.tokens_incomplete, "{u:?}");
+        ProjectUsage::update(dir.path(), |u| u.work_ms = 5).unwrap();
+        let u = ProjectUsage::read(dir.path()).known().unwrap();
+        assert!(u.restarted && u.tokens_incomplete && u.work_ms == 5, "{u:?}");
     }
 
     /// A build turn and a question can save their cost together: neither may overwrite the other.

@@ -876,8 +876,8 @@ impl CraftApp {
                 if let Some(root) = v["project"].as_str().map(PathBuf::from)
                     && let Some(clock) = self.usage.get_mut(&root)
                 {
-                    let working = clock.working();
-                    clock.saved_again(&root, working);
+                    // Only the record is read again: a running build's clock goes on from its start.
+                    clock.read(&root);
                 }
                 self.toast(tr("Set aside as usage.unreadable.json. Builds are counted again from now."), false);
             }
@@ -2489,6 +2489,24 @@ mod tests {
             assert_eq!(seen[1].0.as_deref(), Some(left.text.as_str()));
             assert_eq!(seen[1].1, [rebuild::notes::Carried { id, note: left }]);
         }
+    }
+
+    /// Counting again after a reset reads the new record but keeps a running build's clock.
+    #[test]
+    fn a_reset_keeps_a_running_builds_clock() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join(craft_anything_engine::workspace::USAGE_FILE), b"{ not json").unwrap();
+        let mut app = crate::demo::app(crate::demo::engine(craft_anything_engine::Mode::Beginner, true));
+        let mut clock = crate::usage::ProjectClock::load(d.path());
+        clock.saved_again(d.path(), true);
+        app.usage.insert(d.path().to_path_buf(), clock);
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let before = app.usage[d.path()].elapsed();
+        craft_anything_engine::workspace::ProjectUsage::reset(d.path()).unwrap();
+        app.usage_reset(Ok(serde_json::json!({"project": d.path()})));
+        let clock = &app.usage[d.path()];
+        assert!(clock.working() && !clock.unreadable, "the new record is read");
+        assert!(clock.elapsed() >= before, "the build's time so far isn't lost");
     }
 
     #[test]

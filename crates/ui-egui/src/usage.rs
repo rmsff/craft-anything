@@ -28,7 +28,8 @@ impl ProjectClock {
         clock
     }
 
-    fn read(&mut self, root: &Path) {
+    /// Read the record again, keeping a running build's clock going.
+    pub(crate) fn read(&mut self, root: &Path) {
         let read = ProjectUsage::read(root);
         self.unreadable = read.is_unreadable();
         self.saved = read.known().unwrap_or_default();
@@ -74,7 +75,9 @@ impl ProjectClock {
             return Some(CostStat { label: "AI cost", value: tr("Unknown"), note: None });
         }
         if self.saved.restarted {
-            let value = if self.saved.priced { trf("at least {n}", &[("n", &format!("${:.2}", self.saved.cost_usd))]) } else { tr("Unknown") };
+            // Rounded down: a lower bound rounded up could be more than was spent.
+            let cents = (self.saved.cost_usd * 100.0 + 1e-9).floor() / 100.0;
+            let value = if self.saved.priced { trf("at least {n}", &[("n", &format!("${cents:.2}"))]) } else { tr("Unknown") };
             return Some(CostStat { value, ..cost_stat(&self.saved) });
         }
         self.saved.priced.then(|| cost_stat(&self.saved))
@@ -299,6 +302,9 @@ mod tests {
         c.saved_again(dir.path(), false);
         assert_eq!(c.time_words(), "at least 12m 05s");
         assert_eq!(c.cost().unwrap(), CostStat { label: "AI cost", value: "at least $0.40".into(), note: None });
+        ProjectUsage::update(dir.path(), |u| u.add_turn(0, 0, Some(0.006), false)).unwrap();
+        c.saved_again(dir.path(), false);
+        assert_eq!(c.cost().unwrap().value, "at least $0.40", "a lower bound isn't rounded up");
         assert_eq!(c.tokens().as_deref(), Some("17+"));
         assert!(c.explain("x").contains("earlier builds aren't included"), "{}", c.explain("x"));
     }
