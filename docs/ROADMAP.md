@@ -2465,7 +2465,13 @@ to the project next.
       — in PR #220
 - [ ] Pins of one project sharing with each other, so a third frozen copy of the same assets
       takes no more space
-- [ ] Pin a website (a frozen copy of the built site, each served on its own port) — claimed: rmsff, branch feature/r2.10-pin-website
+- [x] Pin a website (a frozen copy of the built site, each served on its own port): a pin copies
+      the built site alone (a light one shares its media), and opening it serves that copy on a
+      free loopback port of its own until it's closed; a served pin isn't removed
+      (`a_pinned_website_is_served_from_its_copy_on_a_port_of_its_own`)
+      — in PR #2239
+- [ ] A pinned website keeps one address: each open takes a free port, so what the browser keeps
+      for a site (its storage, a sign-in) doesn't carry over to the next time it's opened
 - [ ] A pin started before the app restarted shows as running (keep its process id and start
       time in the pin, and check both), and can be stopped
 - [x] Cap a run's log (`last-run.log`, `play.log`): it grows as long as the program prints. The
