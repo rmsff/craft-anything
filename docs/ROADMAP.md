@@ -2509,7 +2509,11 @@ Owner: open · Status: todo
 Owner: open · Status: in progress
 - [x] Unity: sounds out (the stored stream, usually FSB5; PCM ones as WAV)
       — claimed: NicolasBohn, branch feature/r3.9-unity-sounds
-- [ ] Unity: crunched textures (DXT1Crunched, DXT5Crunched; two of the games checked use them) — claimed: rmsff, branch feature/r3.9-unity-crunched-textures
+- [x] Unity: crunched textures (DXT1Crunched, DXT5Crunched; two of the games checked use them)
+      (#2237)
+- [ ] Unity: crunched textures decode through `texture2ddecoder`, whose crunch reader panics on
+      damaged streams; `unity_texture` catches that, which works only where panics unwind. A
+      crunch reader that checks its input (in craft-libs) would remove the catch
 - [x] Unity: decode R16 and RG16 texture pixels through the shared bounded PNG export path.
       — claimed: Afloat16, branch feature/r3.9-unity-integer-textures-20261109
       Source `540b4947aa1b`; [format checks](https://github.com/Afloat16/claude-mem/actions/runs/42633003467/job/129213811395) and [compatibility gates](https://github.com/Afloat16/claude-mem/actions/runs/42642583301/job/129247271153) passed.
