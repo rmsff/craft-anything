@@ -2242,8 +2242,17 @@ Gaps found while using the app for real projects.
       message saying whether one was forgotten; an address found only in the request (nothing
       typed or picked) gets the same sign-in row, naming the site. Not run with a real browser
       window from the app — PR #2235
-- [ ] Study with the person's own already-running browser through its debugging endpoint, as an
-      alternative to a saved sign-in — claimed: rmsff, branch feature/r2.9-study-running-browser
+- [x] Study with the person's own already-running browser through its debugging endpoint, as an
+      alternative to a saved sign-in: `web_site_open` with `cdp_endpoint` (a loopback port, `http://`
+      or `ws://` address only) opens the site in a new tab of that browser, every browser tool then
+      looks only at that tab, `web_site_close` closes it, and the open and capture say the pages
+      came from the person's own browser. A restricted MCP server refuses it. Tested against a
+      stand-in endpoint; not run with a real browser
+      — PR #2242; claimed: rmsff, branch feature/r2.9-study-running-browser
+- [ ] Offer the person's own running browser in the app and in `craft-anything-cli rebuild`: only
+      `web_site_open` takes `cdp_endpoint`, so Make's study still uses a private browser
+- [ ] A browser that serves only a `ws://` browser address and no `/json` list can't be used for
+      a study yet: the tab is found through `/json/list`
 - [ ] Sign in once with `web_site_sign_in` on a real site behind a login (and with the Ubuntu
       Snap Chromium, whose launcher couldn't start in the test shell) and rebuild it signed in
 - [ ] Refresh a saved sign-in from a capture session when the site renews it, so it lasts longer

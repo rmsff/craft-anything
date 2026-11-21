@@ -560,6 +560,9 @@ fn restricted_web_opens_never_use_a_saved_sign_in() {
     ] {
         assert_eq!(server.restricted_args("web_site_open", args).unwrap()["signed_in"], false);
     }
+    // The person's own browser holds their sign-ins too, so it's refused here.
+    let err = server.restricted_args("web_site_open", json!({"url": "https://example.com", "cdp_endpoint": "http://127.0.0.1:9222"})).unwrap_err();
+    assert_eq!(err.details.as_ref().map(|d| d["param"].clone()), Some(json!("cdp_endpoint")), "{err:?}");
     // Other tools and unrestricted servers are left alone.
     assert_eq!(server.restricted_args("core_session_show", json!({})).unwrap(), json!({}));
     let open = Server::new(engine, ServerOptions::default(), Box::new(Buf::default()));
