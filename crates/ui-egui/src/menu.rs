@@ -185,32 +185,48 @@ impl MenuBar {
 
 /// Turns the Edit items picked since the last frame into input for the frame about to start, for
 /// the focused text box; the rest of the picks wait for [`update`]. Call before the frame runs.
-pub fn feed(app: &mut CraftApp, input: &mut egui::RawInput) {
+pub fn feed(app: &mut CraftApp, ctx: &egui::Context, input: &mut egui::RawInput) {
     let Some(bar) = app.menu_bar.as_mut() else { return };
+    let mut edits = Vec::new();
     for id in bar.picked.try_iter() {
         match bar.actions.iter().find(|(i, _)| *i == id).map(|(_, a)| *a) {
-            Some(Action::Edit(edit)) => insert(&mut input.events, edit, clipboard_text),
+            Some(Action::Edit(edit)) => edits.push(edit),
             Some(action) => bar.pending.push(action),
             None => {}
         }
     }
+    // Cmd as last seen: still held when a shortcut, not the mouse, picked the item.
+    let command = ctx.input(|i| i.modifiers.command);
+    insert(&mut input.events, &edits, command, clipboard_text);
 }
 
-/// Puts what `edit`'s shortcut sends through egui-winit ahead of the frame's events. The menu
-/// takes the shortcut's press, but its release still reaches egui and may be queued already: a
-/// Cmd+V release seen before the paste reads as a pasted picture ([`crate::paste`]).
-fn insert(events: &mut Vec<egui::Event>, edit: Edit, clipboard: impl FnOnce() -> Option<String>) {
+/// Puts what `edits`' shortcuts send through egui-winit ahead of the frame's events, in the order
+/// they were picked. The menu takes a shortcut's press, but its release still reaches egui and may
+/// be queued already: a Cmd+V release seen before the paste reads as a pasted picture
+/// ([`crate::paste`]). With Cmd up (`command`), Paste was picked with the mouse and no release
+/// follows it, so one is added: else the next Cmd+V of a picture would read as this text paste's.
+fn insert(events: &mut Vec<egui::Event>, edits: &[Edit], command: bool, clipboard: impl Fn() -> Option<String>) {
     let cmd = egui::Modifiers::MAC_CMD | egui::Modifiers::COMMAND;
     let key = |key, modifiers| [true, false].map(|pressed| egui::Event::Key { key, physical_key: None, pressed, repeat: false, modifiers }).to_vec();
-    let sent = match edit {
-        Edit::Undo => key(egui::Key::Z, cmd),
-        Edit::Redo => key(egui::Key::Z, cmd | egui::Modifiers::SHIFT),
-        Edit::SelectAll => key(egui::Key::A, cmd),
-        Edit::Cut => vec![egui::Event::Cut],
-        Edit::Copy => vec![egui::Event::Copy],
-        // Like egui-winit: no text on the clipboard, nothing pasted.
-        Edit::Paste => clipboard().map(|t| t.replace("\r\n", "\n")).filter(|t| !t.is_empty()).map(egui::Event::Paste).into_iter().collect(),
-    };
+    let mut sent = Vec::new();
+    for edit in edits {
+        match edit {
+            Edit::Undo => sent.extend(key(egui::Key::Z, cmd)),
+            Edit::Redo => sent.extend(key(egui::Key::Z, cmd | egui::Modifiers::SHIFT)),
+            Edit::SelectAll => sent.extend(key(egui::Key::A, cmd)),
+            Edit::Cut => sent.push(egui::Event::Cut),
+            Edit::Copy => sent.push(egui::Event::Copy),
+            // Like egui-winit: no text on the clipboard, nothing pasted.
+            Edit::Paste => {
+                if let Some(text) = clipboard().map(|t| t.replace("\r\n", "\n")).filter(|t| !t.is_empty()) {
+                    sent.push(egui::Event::Paste(text));
+                    if !command {
+                        sent.push(egui::Event::Key { key: egui::Key::V, physical_key: None, pressed: false, repeat: false, modifiers: egui::Modifiers::NONE });
+                    }
+                }
+            }
+        }
+    }
     events.splice(0..0, sent);
 }
 
@@ -285,9 +301,14 @@ mod tests {
         h
     }
 
-    /// Picks `edit` with `clipboard` holding that text; what the frame that took it copied.
+    /// Picks `edit` with the mouse, `clipboard` holding that text; what the frame that took it copied.
     fn pick(h: &mut egui_kittest::Harness<'static, (String, usize)>, edit: Edit, clipboard: Option<&str>) -> Option<String> {
-        insert(&mut h.input_mut().events, edit, || clipboard.map(str::to_owned));
+        picks(h, &[edit], false, clipboard)
+    }
+
+    /// Picks `edits` in one frame, by their shortcuts (`command` held) or the mouse.
+    fn picks(h: &mut egui_kittest::Harness<'static, (String, usize)>, edits: &[Edit], command: bool, clipboard: Option<&str>) -> Option<String> {
+        insert(&mut h.input_mut().events, edits, command, || clipboard.map(str::to_owned));
         h.step();
         let copied = h.output().platform_output.commands.iter().find_map(|c| match c {
             egui::OutputCommand::CopyText(t) => Some(t.clone()),
@@ -322,9 +343,32 @@ mod tests {
         // Cmd+V released fast: the release reached egui before the menu's paste.
         let release = egui::Event::Key { key: egui::Key::V, physical_key: None, pressed: false, repeat: false, modifiers: egui::Modifiers::COMMAND };
         h.input_mut().events.push(release);
-        pick(&mut h, Edit::Paste, Some("hi"));
+        picks(&mut h, &[Edit::Paste], true, Some("hi"));
         assert_eq!(h.state().0, "hi");
         assert_eq!(h.state().1, 0, "no picture is looked for");
+    }
+
+    /// Text pasted with the mouse has no key release after it, so it must not make the next Cmd+V
+    /// of a picture read as a text paste.
+    #[test]
+    fn pasting_text_with_the_mouse_doesnt_hide_the_next_picture_paste() {
+        let mut h = text_box("");
+        pick(&mut h, Edit::Paste, Some("hi"));
+        assert_eq!(h.state().0, "hi");
+        // Cmd+V with only a picture on the clipboard: the menu pastes no text, the release follows.
+        picks(&mut h, &[Edit::Paste], true, None);
+        let release = egui::Event::Key { key: egui::Key::V, physical_key: None, pressed: false, repeat: false, modifiers: egui::Modifiers::COMMAND };
+        h.input_mut().events.push(release);
+        h.run();
+        assert_eq!(h.state().1, 1, "the picture is looked for");
+    }
+
+    /// Edits picked before one frame run in the order they were picked.
+    #[test]
+    fn edits_picked_in_one_frame_keep_their_order() {
+        let mut h = text_box("hello");
+        picks(&mut h, &[Edit::SelectAll, Edit::Paste], true, Some("new"));
+        assert_eq!(h.state().0, "new");
     }
 
     /// An empty repository field made Help open a local folder instead of the web page.

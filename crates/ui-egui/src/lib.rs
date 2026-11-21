@@ -2454,11 +2454,11 @@ impl eframe::App for CraftApp {
         self.show(ui);
     }
 
-    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
         #[cfg(target_os = "macos")]
-        menu::feed(self, raw_input);
+        menu::feed(self, ctx, raw_input);
         #[cfg(not(target_os = "macos"))]
-        let _ = raw_input;
+        let _ = (ctx, raw_input);
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
