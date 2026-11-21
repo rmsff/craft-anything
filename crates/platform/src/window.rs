@@ -129,16 +129,19 @@ pub fn capture_window(pid: u32, app_name: Option<&str>) -> Result<WindowShot, To
 }
 
 /// Ask the system to bring the windows of the app `pid` runs to the front. False when the request
-/// couldn't be made: `pid` isn't an app with windows (a command-line program, one that quit), or
-/// this system isn't macOS, where it's built in for now. True means the request was sent, not
-/// that it was honoured: macOS may decline one from an app that isn't in front itself.
+/// couldn't be made: `pid` isn't an app with a window on screen (a command-line program, one that
+/// quit, an app still running after its last window closed), or this system isn't macOS, where
+/// it's built in for now. True means the request was sent, not that it was honoured: macOS may
+/// decline one from an app that isn't in front itself.
 pub fn bring_to_front(pid: u32) -> bool {
     #[cfg(target_os = "macos")]
     {
         use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication};
-        let Ok(pid) = i32::try_from(pid) else { return false };
-        NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
-            .is_some_and(|app| app.activateWithOptions(NSApplicationActivationOptions::ActivateAllWindows))
+        let Ok(app_pid) = i32::try_from(pid) else { return false };
+        let Some(app) = NSRunningApplication::runningApplicationWithProcessIdentifier(app_pid) else { return false };
+        // Activating an app with no window shows nothing, so the caller must say it's open instead.
+        let shown = xcap::Window::all().is_ok_and(|ws| ws.iter().any(|w| w.pid().ok() == Some(pid) && !w.is_minimized().unwrap_or(true)));
+        shown && app.activateWithOptions(NSApplicationActivationOptions::ActivateAllWindows)
     }
     #[cfg(not(target_os = "macos"))]
     {
