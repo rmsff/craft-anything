@@ -1047,9 +1047,10 @@ fn side(app: &mut CraftApp, ui: &mut Ui, ws: &Workspace) {
         if widgets::action_row(ui, "folder-open", "Open folder", false).clicked() {
             open_folder(app, ws);
         }
-        // Not mid-build, so a website's copy isn't taken half-made.
-        if outcome(app).is_some()
-            && !app.running()
+        // Not mid-build, so a website's copy isn't taken half-made; only a build there is to pin
+        // (a preview still being served isn't one).
+        if !app.running()
+            && (app.facts.site || app.facts.program)
             && widgets::action_row(ui, "pin", "Pin this build", false).on_hover_text(tr("Keep this version in the sidebar to open any time.")).clicked()
         {
             app.ask_pin(&ws.root);

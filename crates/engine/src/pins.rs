@@ -381,7 +381,10 @@ fn never_copied(p: &Path) -> bool {
 /// as compiler output. A light pin shares its media.
 fn site_files(ws: &Workspace, site: &Path, to: &Path) -> Result<Vec<Planned>, ToolError> {
     let mut found = Vec::new();
-    walk(site, to, &|p| ws.is_own_record(p) || never_copied(p), 0, &mut found)?;
+    // The preview server serves a link that stays inside the site as what it points to; the pin
+    // must too, so those are copied as their targets.
+    let root = std::fs::canonicalize(site).map_err(|e| ToolError::io(site.display(), e))?;
+    walk_in(site, to, &|p| ws.is_own_record(p) || never_copied(p), Some(&root), 0, &mut found)?;
     Ok(found.into_iter().map(|(from, to, len)| Planned { shared: media(&from), from, to, len }).collect())
 }
 
@@ -413,20 +416,39 @@ fn stray_copy(p: &Path) -> bool {
 const WALK_DEPTH: usize = 64;
 
 fn walk(from: &Path, to: &Path, skip: &dyn Fn(&Path) -> bool, depth: usize, out: &mut Vec<(PathBuf, PathBuf, u64)>) -> Result<(), ToolError> {
+    walk_in(from, to, skip, None, depth, out)
+}
+
+/// [`walk`], also following each link whose target is inside `within` (a canonical path), from
+/// that target; other links are left out.
+fn walk_in(
+    from: &Path,
+    to: &Path,
+    skip: &dyn Fn(&Path) -> bool,
+    within: Option<&Path>,
+    depth: usize,
+    out: &mut Vec<(PathBuf, PathBuf, u64)>,
+) -> Result<(), ToolError> {
     if depth > WALK_DEPTH {
         return Err(ToolError::new(ErrorCode::OverLimit, format!("{} is nested more than {WALK_DEPTH} folders deep.", from.display())));
     }
     for entry in std::fs::read_dir(from).map_err(|e| ToolError::io(from.display(), e))? {
         let entry = entry.map_err(|e| ToolError::io(from.display(), e))?;
-        let (path, kind) = (entry.path(), entry.file_type().map_err(|e| ToolError::io(entry.path().display(), e))?);
-        if skip(&path) || kind.is_symlink() {
+        let (mut path, mut kind) = (entry.path(), entry.file_type().map_err(|e| ToolError::io(entry.path().display(), e))?);
+        if skip(&path) {
             continue;
+        }
+        if kind.is_symlink() {
+            let Some(target) = within.and_then(|root| std::fs::canonicalize(&path).ok().filter(|t| t.starts_with(root))) else { continue };
+            kind = std::fs::metadata(&target).map_err(|e| ToolError::io(target.display(), e))?.file_type();
+            path = target;
         }
         let dest = to.join(entry.file_name());
         if kind.is_dir() {
-            walk(&path, &dest, skip, depth + 1, out)?;
+            walk_in(&path, &dest, skip, within, depth + 1, out)?;
         } else if kind.is_file() {
-            out.push((path, dest, entry.metadata().map(|m| m.len()).unwrap_or(0)));
+            let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            out.push((path, dest, len));
         }
     }
     Ok(())
@@ -638,7 +660,9 @@ pub enum Opened {
 pub struct Runs(Mutex<HashMap<String, Vec<Launched>>>);
 
 /// One key per folder (case and slashes don't matter on Windows).
+/// One folder, however its path was written (relative, with `..`), is one key.
 fn key(dir: &Path) -> String {
+    let dir = crate::workspace::normalized(dir);
     let s = dir.to_string_lossy();
     if cfg!(windows) { s.to_lowercase().replace('\\', "/").trim_end_matches('/').to_string() } else { s.trim_end_matches('/').to_string() }
 }
@@ -1149,6 +1173,40 @@ mod tests {
         assert!(size.light_bytes < size.bytes, "a light copy shares the media: {size:?}");
         let light = create(&ws, PinMode::Light, None, None, &mut |_, _| true).unwrap();
         assert!(light.site && light.shared_bytes + light.copied_shared_bytes >= 4096, "the logo is shared, or counted as copied: {light:?}");
+    }
+
+    /// A link inside the built site is served by the preview, so the pin serves it too, as the
+    /// file or folder it points to; one pointing out of the site is served by neither.
+    #[cfg(unix)]
+    #[test]
+    fn a_websites_pin_serves_the_links_inside_the_site() {
+        use std::os::unix::fs::symlink;
+        let d = tempfile::tempdir().unwrap();
+        let ws = Workspace::create(d.path(), "Site", "a page", TargetRef::None).unwrap();
+        let dist = ws.app_dir().join("dist");
+        std::fs::create_dir_all(dist.join("build")).unwrap();
+        std::fs::write(dist.join("index.html"), "<h1>site</h1>").unwrap();
+        std::fs::write(dist.join("build/app.js"), "go()").unwrap();
+        std::fs::write(dist.join("logo.png"), "logo").unwrap();
+        std::fs::write(d.path().join("private.txt"), "not the site's").unwrap();
+        std::fs::create_dir_all(dist.join("img")).unwrap();
+        symlink("../logo.png", dist.join("img/logo.png")).unwrap();
+        symlink("build", dist.join("assets")).unwrap();
+        symlink(d.path().join("private.txt"), dist.join("private.txt")).unwrap();
+
+        let pin = create(&ws, PinMode::Frozen, None, None, &mut |_, _| true).unwrap();
+        let served = std::fs::canonicalize(pin.app_dir(&ws)).unwrap();
+        let serves = |path: &str| craft_anything_platform::serve::resolve(&served, path).map(|f| std::fs::read_to_string(f).unwrap());
+        assert_eq!(serves("/img/logo.png").as_deref(), Some("logo"), "a linked file");
+        assert_eq!(serves("/assets/app.js").as_deref(), Some("go()"), "a linked folder");
+        assert!(!served.join("private.txt").exists(), "a link out of the site isn't copied");
+    }
+
+    /// One folder is one running server or program, however its path is written.
+    #[test]
+    fn a_folder_has_one_key_however_it_is_written() {
+        let here = std::env::current_dir().unwrap();
+        assert_eq!(key(Path::new("pins/../pins/1")), key(&here.join("pins/1")));
     }
 
     #[test]
