@@ -384,7 +384,8 @@ fn site_files(ws: &Workspace, site: &Path, to: &Path) -> Result<Vec<Planned>, To
     // The preview server serves a link that stays inside the site as what it points to; the pin
     // must too, so those are copied as their targets.
     let root = std::fs::canonicalize(site).map_err(|e| ToolError::io(site.display(), e))?;
-    walk_in(site, to, &|p| ws.is_own_record(p) || never_copied(p), Some(&root), 0, &mut found)?;
+    let mut within = Within { chain: vec![root.clone()], root };
+    walk_in(site, to, &|p| ws.is_own_record(p) || never_copied(p), Some(&mut within), 0, &mut found)?;
     Ok(found.into_iter().map(|(from, to, len)| Planned { shared: media(&from), from, to, len }).collect())
 }
 
@@ -419,13 +420,19 @@ fn walk(from: &Path, to: &Path, skip: &dyn Fn(&Path) -> bool, depth: usize, out:
     walk_in(from, to, skip, None, depth, out)
 }
 
-/// [`walk`], also following each link whose target is inside `within` (a canonical path), from
-/// that target; other links are left out.
+/// The canonical folder whose links [`walk_in`] follows, and the real folders it is walking into.
+struct Within {
+    root: PathBuf,
+    chain: Vec<PathBuf>,
+}
+
+/// [`walk`], also following each link whose target is inside `within`'s root, from that target;
+/// other links are left out, and so are links to what `skip` leaves out or to a folder being walked.
 fn walk_in(
     from: &Path,
     to: &Path,
     skip: &dyn Fn(&Path) -> bool,
-    within: Option<&Path>,
+    mut within: Option<&mut Within>,
     depth: usize,
     out: &mut Vec<(PathBuf, PathBuf, u64)>,
 ) -> Result<(), ToolError> {
@@ -438,14 +445,30 @@ fn walk_in(
         if skip(&path) {
             continue;
         }
-        if kind.is_symlink() {
-            let Some(target) = within.and_then(|root| std::fs::canonicalize(&path).ok().filter(|t| t.starts_with(root))) else { continue };
+        let linked = kind.is_symlink();
+        if linked {
+            let Some(w) = within.as_deref() else { continue };
+            let Some(target) = std::fs::canonicalize(&path).ok().filter(|t| t.starts_with(&w.root)) else { continue };
+            // A link into `.git` or the project's records, or back up to a folder being walked
+            // (`self -> .`, which would never end), isn't followed.
+            if target.ancestors().take_while(|a| *a != w.root).any(|a| skip(a)) || w.chain.contains(&target) {
+                continue;
+            }
             kind = std::fs::metadata(&target).map_err(|e| ToolError::io(target.display(), e))?.file_type();
             path = target;
         }
         let dest = to.join(entry.file_name());
         if kind.is_dir() {
-            walk_in(&path, &dest, skip, within, depth + 1, out)?;
+            match within.as_deref_mut() {
+                Some(w) => {
+                    let real = if linked { path.clone() } else { w.chain.last().map_or_else(|| path.clone(), |r| r.join(entry.file_name())) };
+                    w.chain.push(real);
+                    let walked = walk_in(&path, &dest, skip, Some(&mut *w), depth + 1, out);
+                    w.chain.pop();
+                    walked?;
+                }
+                None => walk_in(&path, &dest, skip, None, depth + 1, out)?,
+            }
         } else if kind.is_file() {
             let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
             out.push((path, dest, len));
@@ -660,11 +683,30 @@ pub enum Opened {
 pub struct Runs(Mutex<HashMap<String, Vec<Launched>>>);
 
 /// One key per folder (case and slashes don't matter on Windows).
-/// One folder, however its path was written (relative, with `..`), is one key.
+/// One folder, however its path was written (relative, with `..`, through a link), is one key.
 fn key(dir: &Path) -> String {
-    let dir = crate::workspace::normalized(dir);
+    let dir = followed(dir);
     let s = dir.to_string_lossy();
     if cfg!(windows) { s.to_lowercase().replace('\\', "/").trim_end_matches('/').to_string() } else { s.trim_end_matches('/').to_string() }
+}
+
+/// `dir` made absolute, its deepest part that exists with links followed and the rest with `..`
+/// resolved as written, so `/a/link/../pin` is where the link leads and a removed folder keeps
+/// the path it had.
+fn followed(dir: &Path) -> PathBuf {
+    let dir = workspace::absolute(dir);
+    let mut rest = Vec::new();
+    let mut at = dir.as_path();
+    let mut real = loop {
+        if let Ok(real) = std::fs::canonicalize(at) {
+            break real;
+        }
+        let (Some(parent), Some(last)) = (at.parent(), at.components().next_back()) else { break at.to_path_buf() };
+        rest.push(last);
+        at = parent;
+    };
+    real.extend(rest.iter().rev());
+    workspace::normalized(&real)
 }
 
 impl Runs {
@@ -1202,11 +1244,56 @@ mod tests {
         assert!(!served.join("private.txt").exists(), "a link out of the site isn't copied");
     }
 
+    /// What a site's copy leaves out stays out through a link, and a link back up the site doesn't
+    /// make its copy go round for ever.
+    #[cfg(unix)]
+    #[test]
+    fn a_websites_pin_follows_no_link_into_what_it_leaves_out_or_round_a_loop() {
+        use std::os::unix::fs::symlink;
+        let d = tempfile::tempdir().unwrap();
+        let ws = Workspace::create(d.path(), "Site", "a page", TargetRef::None).unwrap();
+        let dist = ws.app_dir().join("dist");
+        std::fs::create_dir_all(dist.join(".git")).unwrap();
+        std::fs::create_dir_all(dist.join("docs/guide")).unwrap();
+        std::fs::write(dist.join("index.html"), "<h1>site</h1>").unwrap();
+        std::fs::write(dist.join(".git/HEAD"), "ref: main").unwrap();
+        std::fs::write(dist.join("docs/guide/page.html"), "guide").unwrap();
+        symlink(".git", dist.join("repository")).unwrap();
+        symlink(".git/HEAD", dist.join("head")).unwrap();
+        symlink(".", dist.join("self")).unwrap();
+        symlink("../..", dist.join("docs/guide/up")).unwrap();
+        symlink("guide", dist.join("docs/again")).unwrap();
+
+        let pin = create(&ws, PinMode::Frozen, None, None, &mut |_, _| true).unwrap();
+        let app = pin.app_dir(&ws);
+        assert!(!app.join("repository").exists() && !app.join("head").exists(), "nothing of .git");
+        assert!(!app.join("self").exists() && !app.join("docs/guide/up").exists(), "no loop");
+        assert_eq!(std::fs::read_to_string(app.join("docs/again/page.html")).unwrap(), "guide", "a link that isn't a loop is still copied");
+        assert_eq!(std::fs::read_to_string(app.join("docs/guide/page.html")).unwrap(), "guide");
+    }
+
     /// One folder is one running server or program, however its path is written.
     #[test]
     fn a_folder_has_one_key_however_it_is_written() {
         let here = std::env::current_dir().unwrap();
         assert_eq!(key(Path::new("pins/../pins/1")), key(&here.join("pins/1")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_reached_through_a_link_has_its_real_key_and_keeps_it_once_removed() {
+        let d = tempfile::tempdir().unwrap();
+        let (a, b) = (d.path().join("a"), d.path().join("b"));
+        std::fs::create_dir_all(b.join("sub")).unwrap();
+        std::fs::create_dir_all(b.join("pin")).unwrap();
+        std::fs::create_dir_all(a.join("pin")).unwrap();
+        std::os::unix::fs::symlink(b.join("sub"), a.join("link")).unwrap();
+        let through = a.join("link/../pin");
+        assert_eq!(key(&through), key(&b.join("pin")), "the link leads to b");
+        assert_ne!(key(&through), key(&a.join("pin")));
+        let before = key(&b.join("pin"));
+        std::fs::remove_dir(b.join("pin")).unwrap();
+        assert_eq!(key(&b.join("pin")), before, "a removed folder keeps its key");
     }
 
     #[test]
