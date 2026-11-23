@@ -2498,14 +2498,12 @@ to the project next.
       — in PR #220
 - [x] Pins of one project sharing with each other, so a third frozen copy of the same assets
       takes no more space: a media file with the same size and SHA-256 as one in an earlier frozen
-      pin is hard-linked to it, and removing either leaves the other whole
-      (`pins_of_one_project_share_their_equal_media_and_outlive_each_other`)
-      — in PR #2240
-- [ ] A pin's size estimate counts what it would share with the project's other pins (it hashes
-      nothing now, so a frozen pin shows its full size before it's made)
-- [ ] A pin's program rewriting one of its media files in place changes every pin that shares the
-      file (as a light pin's already does with the project): break the link before a pin writes,
-      or open shared files read-only
+      pin is copied from that pin's file, which clones it where copying does (APFS; Btrfs and XFS
+      through `copy_file_range`), and each frozen pin keeps a file of its own
+      (`a_pins_equal_media_are_copied_from_an_earlier_frozen_pin`,
+      `frozen_pins_of_one_project_keep_their_own_files`) — in PR #2240
+- [ ] Frozen pins sharing their media where copying doesn't clone (ext4, NTFS), without a write
+      through one pin reaching another; and a pin's size counting what it shares that way
 - [x] Pin a website (a frozen copy of the built site, each served on its own port): a pin copies
       the built site alone (a light one shares its media), and opening it serves that copy on a
       free loopback port of its own until it's closed; a served pin isn't removed

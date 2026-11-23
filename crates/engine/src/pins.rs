@@ -16,10 +16,10 @@
 //! were; only a file rewritten in place changes in both. Programs a pin or Play started are kept
 //! in [`Runs`], one at a time per folder unless another is asked for.
 //!
-//! Pins of one project share their media: a file with the same bytes as one in an earlier frozen
-//! pin is hard-linked to it, so another frozen copy of the same assets takes no more space, and
-//! removing one pin leaves the other's file as it was. Only a file rewritten in place changes in
-//! both, as with a light pin.
+//! A media file with the same bytes as one in an earlier frozen pin is copied from that pin's file
+//! rather than from the project's. Each pin keeps a file of its own, so writing to one never
+//! changes another; where copying clones (APFS on macOS, and Btrfs or XFS, which can serve Linux's
+//! `copy_file_range` as a reflink) the two share their blocks until one is written to.
 //!
 //! A pin of a **website** copies the built site (`dist/`, `build/`, `out/` or the app itself) into
 //! `app/`, and opening it serves that copy on a loopback port of its own ([`Sites`]).
@@ -124,8 +124,7 @@ pub struct Pin {
     /// What its copy takes on disk.
     #[serde(default)]
     pub bytes: u64,
-    /// What it shares rather than copies: a light pin's files linked to the project's, and media
-    /// linked to an equal file in another of the project's frozen pins.
+    /// What a light pin shares with the project.
     #[serde(default)]
     pub shared_bytes: u64,
     /// Bytes that were meant to be shared (hard-linked) but had to be copied instead, because the
@@ -646,8 +645,8 @@ fn copy_linking(
     copy_files(&Plan::new(ws, program, copy_external).files(ws, to)?, mode, &PinnedMedia::of(ws), progress, link)
 }
 
-/// Media already in the project's frozen pins, by size, so a new pin links a file with the same
-/// bytes instead of keeping another copy. Only frozen pins: a light pin's media are the project's
+/// Media already in the project's frozen pins, by size, so a new pin copies a file with the same
+/// bytes from there (see the module docs). Only frozen pins: a light pin's media are the project's
 /// own files, which a rebuild may rewrite.
 #[derive(Default)]
 struct PinnedMedia(HashMap<u64, Vec<(PathBuf, LazyDigest)>>);
@@ -674,11 +673,12 @@ impl PinnedMedia {
         PinnedMedia(by_len)
     }
 
-    /// A pinned file with the same bytes as `from`; each file is read for its digest once at most.
-    fn same_as(&self, from: &Path, len: u64) -> Option<&Path> {
+    /// A pinned file with the same bytes as `from`, and their digest; each pinned file is read for
+    /// its digest once at most.
+    fn same_as(&self, from: &Path, len: u64) -> Option<(&Path, [u8; 32])> {
         let candidates = self.0.get(&len)?;
         let wanted = digest(from)?;
-        candidates.iter().find(|(path, d)| *d.get_or_init(|| digest(path)) == Some(wanted)).map(|(path, _)| path.as_path())
+        candidates.iter().find(|(path, d)| *d.get_or_init(|| digest(path)) == Some(wanted)).map(|(path, _)| (path.as_path(), wanted))
     }
 }
 
@@ -690,9 +690,10 @@ fn digest(p: &Path) -> Option<[u8; 32]> {
     Some(hash.finalize().into())
 }
 
-/// Copy `files`; what it took and what it shares, with the project (a light pin) or with an equal
-/// file in another pin (`pinned`). A file that can't be linked (a drive without hard links, a file
-/// with as many as it can have) is copied.
+/// Copy `files`; what it took and what a light pin shares with the project. A file that can't be
+/// linked (a drive without hard links, a file with as many as it can have) is copied. A media file
+/// equal to one in `pinned` is copied from there, and again from the project when the copy turns
+/// out to hold other bytes (that file changed after it was read).
 fn copy_files(
     files: &[Planned],
     mode: PinMode,
@@ -714,15 +715,18 @@ fn copy_files(
             done = done.saturating_add(f.len);
             continue;
         }
-        let linked = (mode == PinMode::Light && f.shared && link(&f.from, &f.to).is_ok())
-            || (f.shared && media(&f.from) && pinned.same_as(&f.from, f.len).is_some_and(|same| link(same, &f.to).is_ok()));
-        if linked {
+        if mode == PinMode::Light && f.shared && link(&f.from, &f.to).is_ok() {
             shared = shared.saturating_add(f.len);
         } else {
-            std::fs::copy(&f.from, &f.to).map_err(|e| {
-                ToolError::io(f.from.display(), e)
-                    .with_remediation("Check there's room on the drive for the copy, or pin it as a light copy, which takes less.")
-            })?;
+            // Never a link to another pin's file: a frozen pin's copy is its own.
+            let same = if f.shared && media(&f.from) { pinned.same_as(&f.from, f.len) } else { None };
+            let from_pin = same.is_some_and(|(pinned, wanted)| std::fs::copy(pinned, &f.to).is_ok() && digest(&f.to) == Some(wanted));
+            if !from_pin {
+                std::fs::copy(&f.from, &f.to).map_err(|e| {
+                    ToolError::io(f.from.display(), e)
+                        .with_remediation("Check there's room on the drive for the copy, or pin it as a light copy, which takes less.")
+                })?;
+            }
             if mode == PinMode::Light && f.shared {
                 copied_shared = copied_shared.saturating_add(f.len);
             }
@@ -1241,70 +1245,63 @@ mod tests {
         assert_eq!(std::fs::read_to_string(to.join("assets/sky.PNG")).unwrap(), "old sky", "the copy is still usable");
     }
 
-    #[cfg(unix)]
-    fn inode(p: &Path) -> u64 {
-        use std::os::unix::fs::MetadataExt;
-        std::fs::metadata(p).unwrap().ino()
-    }
-
-    /// Media with the same bytes as a file in an earlier frozen pin are linked to it, whatever
-    /// they are called, and removing that pin leaves the later one whole.
+    /// Media with the same bytes as a file in an earlier frozen pin are copied from it, whatever
+    /// they are called; a light pin's files, the project's own, are never the source.
     #[test]
-    fn pins_of_one_project_share_their_equal_media_and_outlive_each_other() {
+    fn a_pins_equal_media_are_copied_from_an_earlier_frozen_pin() {
         let d = tempfile::tempdir().unwrap();
         let ws = built(d.path());
         let app = ws.app_dir();
         std::fs::write(app.join("assets/sky.png"), vec![7u8; 4096]).unwrap();
         std::fs::write(app.join("assets/song.ogg"), "first song").unwrap();
         let first = create(&ws, PinMode::Frozen, None, None, &mut |_, _| true).unwrap();
-        assert_eq!(first.shared_bytes, 0, "there's no pin to share with yet");
+        create(&ws, PinMode::Light, None, None, &mut |_, _| true).unwrap();
 
         // The next build keeps the sky, adds the same picture under another name and changes the
         // song, keeping its size.
         std::fs::write(app.join("assets/sky-again.png"), vec![7u8; 4096]).unwrap();
         std::fs::write(app.join("assets/song.ogg"), "other song").unwrap();
-        let second = create(&ws, PinMode::Frozen, None, None, &mut |_, _| true).unwrap();
-        assert_eq!(second.shared_bytes, 8192, "both skies are the first pin's: {second:?}");
-        assert_eq!(second.bytes, first.bytes - 4096, "only the song and the rest take more space");
-        let (one, two) = (first.app_dir(&ws), second.app_dir(&ws));
-        assert_eq!(std::fs::read_to_string(two.join("assets/song.ogg")).unwrap(), "other song");
-        assert_eq!(std::fs::read_to_string(one.join("assets/song.ogg")).unwrap(), "first song");
-        #[cfg(unix)]
-        {
-            assert_eq!(inode(&one.join("assets/sky.png")), inode(&two.join("assets/sky.png")), "the sky is kept once");
-            assert_eq!(inode(&one.join("assets/sky.png")), inode(&two.join("assets/sky-again.png")), "an equal file under another name too");
-            assert_ne!(inode(&one.join("assets/song.ogg")), inode(&two.join("assets/song.ogg")), "a file of the same size but other bytes is copied");
+        let pinned = PinnedMedia::of(&ws);
+        let sky = first.app_dir(&ws).join("assets/sky.png");
+        for name in ["sky.png", "sky-again.png"] {
+            assert_eq!(pinned.same_as(&app.join("assets").join(name), 4096).map(|(p, _)| p), Some(sky.as_path()), "{name}");
         }
-
-        delete(&ws, first.id).unwrap();
-        assert_eq!(std::fs::read(two.join("assets/sky.png")).unwrap(), vec![7u8; 4096], "removing the first pin leaves the second's files");
-        assert_eq!(std::fs::read(two.join("assets/sky-again.png")).unwrap(), vec![7u8; 4096]);
-
-        // A light pin's media are the project's, which a rebuild may rewrite: a frozen pin shares
-        // with the frozen one, never with those.
-        create(&ws, PinMode::Light, None, None, &mut |_, _| true).unwrap();
-        let third = create(&ws, PinMode::Frozen, None, None, &mut |_, _| true).unwrap();
-        assert_eq!(third.shared_bytes, 8192 + 10, "both skies and the song are the second pin's");
-        #[cfg(unix)]
-        {
-            let sky = third.app_dir(&ws).join("assets/sky.png");
-            assert_eq!(inode(&sky), inode(&two.join("assets/sky.png")));
-            assert_ne!(inode(&sky), inode(&app.join("assets/sky.png")), "not linked to the project's file");
-        }
+        assert_eq!(pinned.same_as(&app.join("assets/song.ogg"), 10), None, "same size, other bytes");
+        assert_eq!(pinned.0.values().flatten().count(), 2, "only the frozen pin's picture and song");
     }
 
+    /// Frozen pins with the same media each keep a file of their own: one pin's program writing to
+    /// it, or a pin being removed, leaves the other's as it was.
     #[test]
-    fn a_file_that_cannot_be_linked_to_another_pin_is_copied() {
+    fn frozen_pins_of_one_project_keep_their_own_files() {
+        let d = tempfile::tempdir().unwrap();
+        let ws = built(d.path());
+        std::fs::write(ws.app_dir().join("assets/sky.png"), vec![7u8; 4096]).unwrap();
+        let first = create(&ws, PinMode::Frozen, None, None, &mut |_, _| true).unwrap();
+        let second = create(&ws, PinMode::Frozen, None, None, &mut |_, _| true).unwrap();
+        assert_eq!((second.shared_bytes, second.bytes), (0, first.bytes), "a frozen pin shares nothing it could be changed through");
+        let (one, two) = (first.app_dir(&ws).join("assets/sky.png"), second.app_dir(&ws).join("assets/sky.png"));
+        std::io::Write::write_all(&mut std::fs::OpenOptions::new().write(true).open(&one).unwrap(), b"repainted").unwrap();
+        assert_eq!(std::fs::read(&two).unwrap(), vec![7u8; 4096], "written in place in the first pin only");
+        delete(&ws, first.id).unwrap();
+        assert_eq!(std::fs::read(&two).unwrap(), vec![7u8; 4096]);
+    }
+
+    /// A pinned file that changed after it was read for its digest isn't what the new pin gets.
+    #[test]
+    fn a_pinned_file_changed_since_it_was_read_is_copied_from_the_project() {
         let d = tempfile::tempdir().unwrap();
         let ws = built(d.path());
         let app = ws.app_dir();
         std::fs::write(app.join("assets/sky.png"), vec![7u8; 4096]).unwrap();
-        create(&ws, PinMode::Frozen, None, None, &mut |_, _| true).unwrap();
-        let no_links = |_: &Path, _: &Path| Err(std::io::Error::other("no hard links here"));
-        let to = d.path().join("pin-copied");
-        let (_, shared, copied) = copy_linking(&ws, &app, true, &to, PinMode::Frozen, &mut |_, _| true, &no_links).unwrap();
-        assert_eq!((shared, copied), (0, 0), "a frozen pin that can't link copies, as it always did");
-        assert_eq!(std::fs::read(to.join("assets/sky.png")).unwrap(), vec![7u8; 4096]);
+        let first = create(&ws, PinMode::Frozen, None, None, &mut |_, _| true).unwrap();
+        let pinned = PinnedMedia::of(&ws);
+        assert!(pinned.same_as(&app.join("assets/sky.png"), 4096).is_some());
+        std::fs::write(first.app_dir(&ws).join("assets/sky.png"), vec![8u8; 4096]).unwrap();
+        let to = d.path().join("pin-copy");
+        let files = Plan::new(&ws, &app, true).files(&ws, &to).unwrap();
+        copy_files(&files, PinMode::Frozen, &pinned, &mut |_, _| true, &|from, to| std::fs::hard_link(from, to)).unwrap();
+        assert_eq!(std::fs::read(to.join("assets/sky.png")).unwrap(), vec![7u8; 4096], "the project's bytes");
     }
 
     #[test]
