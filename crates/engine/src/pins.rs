@@ -451,7 +451,7 @@ fn walk_in(
             let Some(target) = std::fs::canonicalize(&path).ok().filter(|t| t.starts_with(&w.root)) else { continue };
             // A link into `.git` or the project's records, or back up to a folder being walked
             // (`self -> .`, which would never end), isn't followed.
-            if target.ancestors().take_while(|a| *a != w.root).any(|a| skip(a)) || w.chain.contains(&target) {
+            if target.ancestors().take_while(|a| *a != w.root).any(skip) || w.chain.contains(&target) {
                 continue;
             }
             kind = std::fs::metadata(&target).map_err(|e| ToolError::io(target.display(), e))?.file_type();
