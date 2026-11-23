@@ -234,9 +234,16 @@ pub fn mip0_size(format: i32, width: u32, height: u32) -> Option<usize> {
 
 /// Decode a crunched stream's full-size picture into RGBA, rows in stored order.
 fn decode_crunched(block_bytes: u32, width: u32, height: u32, data: &[u8]) -> Result<Vec<u8>, FormatError> {
-    let rgba_bytes = pixels::size(Layout::Rgba32, width, height).filter(|n| *n as u64 <= pixels::DEFAULT_MAX_RGBA_BYTES);
-    let rgba_bytes = rgba_bytes.ok_or_else(|| FormatError::TooLarge(format!("a {width}×{height} RGBA picture")))?;
+    let too_large = || FormatError::TooLarge(format!("a {width}×{height} RGBA picture"));
+    pixels::size(Layout::Rgba32, width, height).filter(|n| *n as u64 <= pixels::DEFAULT_MAX_RGBA_BYTES).ok_or_else(too_large)?;
     let len = u32::try_from(data.len()).map_err(|_| FormatError::TooLarge("a crunched stream over 4 GiB".into()))?;
+    // texture2ddecoder 0.1.2 walks blocks in pairs of columns and steps to the next row by the
+    // row's bytes minus a pair-rounded width, which underflows (a panic where overflow is
+    // checked) for an odd number of block columns. Such a stream already holds the padding
+    // column's blocks, so it is decoded as one block column wider and cut back to `width`.
+    let blocks_x = width.div_ceil(4);
+    let decoded_width = if blocks_x.is_multiple_of(2) { width } else { (blocks_x + 1) * 4 };
+    let decoded_bytes = pixels::size(Layout::Rgba32, decoded_width, height).ok_or_else(too_large)?;
     // The decoder indexes the stream by the offsets its header gives without checking them, so a
     // damaged stream panics inside it; that is caught here and reported like any malformed data.
     let decoded = std::panic::catch_unwind(|| {
@@ -247,8 +254,14 @@ fn decode_crunched(block_bytes: u32, width: u32, height: u32, data: &[u8]) -> Re
         if (info.width, info.height, info.bytes_per_block) != (width, height, block_bytes) {
             return Err("it holds a different picture than the texture describes");
         }
-        let mut image = vec![0u32; rgba_bytes / 4];
-        texture2ddecoder::decode_unity_crunch(data, width as usize, height as usize, &mut image).map(|()| image)
+        let mut stream = std::borrow::Cow::Borrowed(data);
+        if decoded_width != width {
+            // The header's width is the big-endian 16 bits at offset 12; the decoder doesn't check its CRC.
+            let wide = u16::try_from(decoded_width).map_err(|_| "it is too wide to decode")?;
+            stream.to_mut()[12..14].copy_from_slice(&wide.to_be_bytes());
+        }
+        let mut image = vec![0u32; decoded_bytes / 4];
+        texture2ddecoder::decode_unity_crunch(&stream, decoded_width as usize, height as usize, &mut image).map(|()| image)
     });
     let image = match decoded {
         Ok(Ok(image)) => image,
@@ -257,7 +270,8 @@ fn decode_crunched(block_bytes: u32, width: u32, height: u32, data: &[u8]) -> Re
     };
     // Each pixel is the bytes blue, green, red, alpha.
     Ok(image
-        .iter()
+        .chunks(decoded_width as usize)
+        .flat_map(|row| &row[..width as usize])
         .flat_map(|p| {
             let [b, g, r, a] = p.to_le_bytes();
             [r, g, b, a]
@@ -395,6 +409,32 @@ mod tests {
             assert!(matches!(decode(format, side, side, dxt1), Err(FormatError::Malformed(_))), "{format} {side}");
         }
         assert!(matches!(decode(28, 16384, 16384, dxt1), Err(FormatError::TooLarge(_))));
+    }
+
+    /// A fixture stream relabelled as a smaller picture: its first blocks, decoded in the order
+    /// any stream of that size is read.
+    fn relabelled(dxt5: bool, width: u16, height: u16) -> Vec<u8> {
+        let mut data = unity_crunched_512(dxt5).to_vec();
+        data[12..14].copy_from_slice(&width.to_be_bytes());
+        data[14..16].copy_from_slice(&height.to_be_bytes());
+        data
+    }
+
+    #[test]
+    fn a_picture_one_block_column_wide_decodes() {
+        // 4 pixels is one block column; the decoder reads blocks in pairs of columns, so the stream
+        // holds a second column, and an 8×8 picture is the same blocks with that column shown.
+        for (format, dxt5) in [(28, false), (29, true)] {
+            let narrow = decode(format, 4, 8, &relabelled(dxt5, 4, 8)).unwrap_or_else(|e| panic!("{format}: {e}"));
+            let wide = decode(format, 8, 8, &relabelled(dxt5, 8, 8)).unwrap();
+            let left: Vec<u8> = wide.chunks(8 * 4).flat_map(|row| &row[..4 * 4]).copied().collect();
+            assert_eq!(narrow, left, "{format}");
+            // Three block columns (12 pixels) likewise end in a padding column.
+            let odd = decode(format, 12, 4, &relabelled(dxt5, 12, 4)).unwrap();
+            let even = decode(format, 16, 4, &relabelled(dxt5, 16, 4)).unwrap();
+            let left: Vec<u8> = even.chunks(16 * 4).flat_map(|row| &row[..12 * 4]).copied().collect();
+            assert_eq!(odd, left, "{format}");
+        }
     }
 
     #[test]
