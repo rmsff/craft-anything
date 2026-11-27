@@ -606,6 +606,10 @@ pub fn create(ws: &Workspace, mode: PinMode, name: Option<&str>, godot: Option<&
         // Cargo environment applies.
         if !site {
             pin.launch(ws, godot, &CargoEnv::default())?;
+        } else if !pin.app_dir(ws).join("index.html").is_file() {
+            // The site was found by an index.html that leads out of it, which the copy leaves out.
+            return Err(ToolError::new(ErrorCode::NotFound, "There's nothing to serve in this pin: the website's index.html isn't part of the site.")
+                .with_remediation("Make index.html a file inside the built site (not a link out of it), then pin it."));
         }
         save(ws, &pin)
     })();
@@ -1307,6 +1311,23 @@ mod tests {
         assert_eq!(serves("/img/logo.png").as_deref(), Some("logo"), "a linked file");
         assert_eq!(serves("/assets/app.js").as_deref(), Some("go()"), "a linked folder");
         assert!(!served.join("private.txt").exists(), "a link out of the site isn't copied");
+    }
+
+    /// A site whose index.html leads out of it has nothing its pin could serve, so it isn't pinned.
+    #[cfg(unix)]
+    #[test]
+    fn a_website_whose_index_leads_out_of_it_is_not_pinned() {
+        use std::os::unix::fs::symlink;
+        let d = tempfile::tempdir().unwrap();
+        let ws = Workspace::create(d.path(), "Site", "a page", TargetRef::None).unwrap();
+        let dist = ws.app_dir().join("dist");
+        std::fs::create_dir_all(&dist).unwrap();
+        std::fs::write(d.path().join("outside.html"), "<h1>not the site's</h1>").unwrap();
+        symlink(d.path().join("outside.html"), dist.join("index.html")).unwrap();
+
+        assert_eq!(create(&ws, PinMode::Frozen, None, None, &mut |_, _| true).unwrap_err().code, ErrorCode::NotFound);
+        assert!(list(&ws).is_empty());
+        assert_eq!(std::fs::read_dir(ws.root.join(PINNED)).unwrap().count(), 0, "the half-made pin is gone");
     }
 
     /// A link named unlike the file it leads to is served as that file's kind, as the preview
