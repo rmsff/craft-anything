@@ -392,7 +392,7 @@ fn site_files(ws: &Workspace, site: &Path, to: &Path) -> Result<Vec<Planned>, To
     // The preview server serves a link that stays inside the site as what it points to; the pin
     // must too, so those are copied as their targets.
     let root = std::fs::canonicalize(site).map_err(|e| ToolError::io(site.display(), e))?;
-    let mut within = Within { chain: vec![root.clone()], root };
+    let mut within = Within { chain: vec![root.clone()], root, entries: 0 };
     walk_in(site, to, &|p| ws.is_own_record(p) || never_copied(p), Some(&mut within), 0, &mut found)?;
     Ok(found.into_iter().map(|(from, to, len)| Planned { shared: media(&from), from, to, len }).collect())
 }
@@ -423,6 +423,9 @@ fn stray_copy(p: &Path) -> bool {
 
 /// How deep a copy goes.
 const WALK_DEPTH: usize = 64;
+/// Most files and folders a website's copy walks, counting each time a link leads to one again:
+/// a folder linked from each of 24 folders nested in one another is walked 2^24 times.
+const WALK_ENTRIES: usize = 100_000;
 
 fn walk(from: &Path, to: &Path, skip: &dyn Fn(&Path) -> bool, depth: usize, out: &mut Vec<(PathBuf, PathBuf, u64)>) -> Result<(), ToolError> {
     walk_in(from, to, skip, None, depth, out)
@@ -432,6 +435,8 @@ fn walk(from: &Path, to: &Path, skip: &dyn Fn(&Path) -> bool, depth: usize, out:
 struct Within {
     root: PathBuf,
     chain: Vec<PathBuf>,
+    /// Files and folders walked so far, up to [`WALK_ENTRIES`].
+    entries: usize,
 }
 
 /// [`walk`], also following each link whose target is inside `within`'s root, from that target;
@@ -452,6 +457,16 @@ fn walk_in(
         let (mut path, mut kind) = (entry.path(), entry.file_type().map_err(|e| ToolError::io(entry.path().display(), e))?);
         if skip(&path) {
             continue;
+        }
+        if let Some(w) = within.as_deref_mut() {
+            w.entries += 1;
+            if w.entries > WALK_ENTRIES {
+                return Err(ToolError::new(
+                    ErrorCode::OverLimit,
+                    format!("{} holds more than {WALK_ENTRIES} files and folders, counting each one its links lead to.", w.root.display()),
+                )
+                .with_remediation("Remove the links that lead to the same folders again, then pin it."));
+            }
         }
         let linked = kind.is_symlink();
         if linked {
@@ -1278,6 +1293,37 @@ mod tests {
         assert!(!app.join("self").exists() && !app.join("docs/guide/up").exists(), "no loop");
         assert_eq!(std::fs::read_to_string(app.join("docs/again/page.html")).unwrap(), "guide", "a link that isn't a loop is still copied");
         assert_eq!(std::fs::read_to_string(app.join("docs/guide/page.html")).unwrap(), "guide");
+    }
+
+    /// A link to the next folder down in each of many nested folders doubles the walk at every
+    /// level; past a limit the pin is refused, while a few such links are still copied.
+    #[cfg(unix)]
+    #[test]
+    fn a_websites_pin_refuses_links_that_multiply_its_files_but_copies_a_few() {
+        use std::os::unix::fs::symlink;
+        let nest = |levels: usize| {
+            let d = tempfile::tempdir().unwrap();
+            let ws = Workspace::create(d.path(), "Site", "a page", TargetRef::None).unwrap();
+            let mut dir = ws.app_dir().join("dist");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("index.html"), "<h1>site</h1>").unwrap();
+            for _ in 0..levels {
+                std::fs::create_dir(dir.join("n")).unwrap();
+                symlink("n", dir.join("alias")).unwrap();
+                dir = dir.join("n");
+            }
+            std::fs::write(dir.join("page.html"), "deep").unwrap();
+            (d, ws)
+        };
+
+        let (_d, ws) = nest(20);
+        assert_eq!(estimate(&ws, None).unwrap_err().code, ErrorCode::OverLimit);
+
+        let (_d, ws) = nest(3);
+        assert_eq!(estimate(&ws, None).unwrap().files, 1 + (1 << 3), "the index, and the deep page by each way to it");
+        let app = create(&ws, PinMode::Frozen, None, None, &mut |_, _| true).unwrap().app_dir(&ws);
+        assert_eq!(std::fs::read_to_string(app.join("alias/alias/alias/page.html")).unwrap(), "deep");
+        assert_eq!(std::fs::read_to_string(app.join("n/alias/n/page.html")).unwrap(), "deep");
     }
 
     /// One folder is one running server or program, however its path is written.
