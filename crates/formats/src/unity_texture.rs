@@ -293,6 +293,9 @@ fn decode_crunched(block_bytes: u32, width: u32, height: u32, data: &[u8]) -> Re
 
 /// Decode the full-size picture (`data` starts with it) into RGBA, top row first.
 pub fn decode(format: i32, width: u32, height: u32, data: &[u8]) -> Result<Vec<u8>, FormatError> {
+    if width == 0 || height == 0 {
+        return Err(FormatError::Malformed("an empty picture".into()));
+    }
     if let Some(block_bytes) = crunched_block_bytes(format) {
         return Ok(pixels::flip_rows(&decode_crunched(block_bytes, width, height, data)?, width));
     }
@@ -447,6 +450,18 @@ mod tests {
             let left: Vec<u8> = even.chunks(16 * 4).flat_map(|row| &row[..12 * 4]).copied().collect();
             assert_eq!(odd, left, "{format}");
         }
+    }
+
+    #[test]
+    fn an_empty_picture_is_refused_without_panicking() {
+        // A crunched stream decoded zero pixels wide would be cut into zero-width rows.
+        for (format, dxt5) in [(28, false), (29, true)] {
+            for (width, height) in [(0, 8), (8, 0)] {
+                let data = relabelled(dxt5, width, height);
+                assert!(matches!(decode(format, width.into(), height.into(), &data), Err(FormatError::Malformed(_))), "{format} {width}×{height}");
+            }
+        }
+        assert!(matches!(decode(10, 0, 8, &[0; 32]), Err(FormatError::Malformed(_))));
     }
 
     #[test]
