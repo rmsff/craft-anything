@@ -646,6 +646,14 @@ fn usage_v1_to_v2(doc: &mut Value) -> Result<(), String> {
     Ok(())
 }
 
+/// Both are regular files with the same bytes. One too big to be a usage record reads as different.
+fn same_bytes(a: &Path, b: &Path) -> bool {
+    match (read_file_capped(a, MAX_USAGE_BYTES), read_file_capped(b, MAX_USAGE_BYTES)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
 /// Read a `usage.json` document of any version this build understands. A newer one is read as far
 /// as its fields are known and keeps its version, so [`ProjectUsage::update`] refuses to write it.
 fn read_usage(bytes: &[u8]) -> Option<ProjectUsage> {
@@ -743,6 +751,8 @@ impl ProjectUsage {
         // ever replaces it (a rename would, on Unix). The new record then replaces usage.json.
         match std::fs::hard_link(&usage, &aside) {
             Ok(()) => {}
+            // An earlier reset stopped after setting this same record aside: it carries on.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && same_bytes(&usage, &aside) => {}
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Err(already()),
             // A drive without hard links: checked, then moved.
             Err(_) if std::fs::symlink_metadata(&aside).is_ok() => return Err(already()),
@@ -1800,6 +1810,20 @@ mod tests {
         ProjectUsage::update(dir.path(), |u| u.work_ms = 5).unwrap();
         let u = ProjectUsage::read(dir.path()).known().unwrap();
         assert!(u.restarted && u.tokens_incomplete && u.work_ms == 5, "{u:?}");
+    }
+
+    /// #2212 review: a reset that stopped after the hard link (a failed write, or the process
+    /// ending) left the same record in both files, and trying again refused for good.
+    #[test]
+    fn a_reset_stopped_after_setting_the_record_aside_finishes_when_tried_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join(USAGE_FILE), b"{ not json").unwrap();
+        std::fs::hard_link(root.join(USAGE_FILE), root.join(USAGE_SET_ASIDE)).unwrap();
+        assert_eq!(ProjectUsage::reset(root).unwrap(), root.join(USAGE_SET_ASIDE));
+        let fresh = ProjectUsage::read(root).known().unwrap();
+        assert!(fresh.restarted && fresh.tokens_incomplete, "{fresh:?}");
+        assert_eq!(std::fs::read(root.join(USAGE_SET_ASIDE)).unwrap(), b"{ not json", "the set-aside record is kept as it was");
     }
 
     /// #2212 review: a restarted record stayed version 1, which a build from before `restarted`
