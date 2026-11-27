@@ -255,6 +255,8 @@ struct Planned {
     len: u64,
     /// A light pin may share it with the project.
     shared: bool,
+    /// Made as a link to this path, relative to where it goes, when a link can be made.
+    link: Option<PathBuf>,
 }
 
 /// What a copy of `app` keeps of the folders a copy normally leaves out, for its start.
@@ -371,7 +373,7 @@ impl Plan {
             .chain(dependencies)
             .map(|((from, to, len), is_own)| {
                 let shared = !beside_program(&from) && (!is_own || media(&from));
-                Planned { from, to, len, shared }
+                Planned { from, to, len, shared, link: None }
             })
             .collect())
     }
@@ -392,9 +394,9 @@ fn site_files(ws: &Workspace, site: &Path, to: &Path) -> Result<Vec<Planned>, To
     // The preview server serves a link that stays inside the site as what it points to; the pin
     // must too, so those are copied as their targets.
     let root = std::fs::canonicalize(site).map_err(|e| ToolError::io(site.display(), e))?;
-    let mut within = Within { chain: vec![root.clone()], root, entries: 0 };
+    let mut within = Within { chain: vec![root.clone()], root, to: to.to_path_buf(), entries: 0, links: HashMap::new() };
     walk_in(site, to, &|p| ws.is_own_record(p) || never_copied(p), Some(&mut within), 0, &mut found)?;
-    Ok(found.into_iter().map(|(from, to, len)| Planned { shared: media(&from), from, to, len }).collect())
+    Ok(found.into_iter().map(|(from, to, len)| Planned { shared: media(&from), link: within.links.remove(&to), from, to, len }).collect())
 }
 
 fn compiler_leftover(p: &Path) -> bool {
@@ -435,8 +437,14 @@ fn walk(from: &Path, to: &Path, skip: &dyn Fn(&Path) -> bool, depth: usize, out:
 struct Within {
     root: PathBuf,
     chain: Vec<PathBuf>,
+    /// Where `root` is copied to.
+    to: PathBuf,
     /// Files and folders walked so far, up to [`WALK_ENTRIES`].
     entries: usize,
+    /// Each copy of a linked file named unlike it (`main -> build/app.js`), and the way from that
+    /// copy's folder to the file's own copy: the server picks a file's kind by its name, so the
+    /// copy stays a link to it, as the preview serves it.
+    links: HashMap<PathBuf, PathBuf>,
 }
 
 /// [`walk`], also following each link whose target is inside `within`'s root, from that target;
@@ -493,11 +501,24 @@ fn walk_in(
                 None => walk_in(&path, &dest, skip, None, depth + 1, out)?,
             }
         } else if kind.is_file() {
+            if linked
+                && let Some(w) = within.as_deref_mut()
+                && !same_extension(Path::new(&entry.file_name()), &path)
+                && let (Ok(real), Ok(here)) = (path.strip_prefix(&w.root), to.strip_prefix(&w.to))
+            {
+                let up: PathBuf = here.components().map(|_| "..").collect();
+                w.links.insert(dest.clone(), up.join(real));
+            }
             let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
             out.push((path, dest, len));
         }
     }
     Ok(())
+}
+
+fn same_extension(a: &Path, b: &Path) -> bool {
+    let extension = |p: &Path| p.extension().map(|e| e.to_string_lossy().to_ascii_lowercase());
+    extension(a) == extension(b)
 }
 
 /// What a build in `app` is: a website's folder, or a program and its arguments (see
@@ -630,6 +651,11 @@ fn copy_files(
         if let Some(d) = f.to.parent() {
             std::fs::create_dir_all(d).map_err(|e| ToolError::io(d.display(), e))?;
         }
+        // A drive or system that can't make the link gets a copy instead.
+        if f.link.as_deref().is_some_and(|target| symlink_file(target, &f.to).is_ok()) {
+            done = done.saturating_add(f.len);
+            continue;
+        }
         if mode == PinMode::Light && f.shared && link(&f.from, &f.to).is_ok() {
             shared = shared.saturating_add(f.len);
         } else {
@@ -645,6 +671,22 @@ fn copy_files(
     }
     progress(total, total);
     Ok((total.saturating_sub(shared), shared, copied_shared))
+}
+
+#[cfg(unix)]
+fn symlink_file(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+/// Windows makes one only in Developer Mode or for an admin.
+#[cfg(windows)]
+fn symlink_file(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_file(target, link)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn symlink_file(_: &Path, _: &Path) -> std::io::Result<()> {
+    Err(std::io::ErrorKind::Unsupported.into())
 }
 
 /// Give a pin a new name.
@@ -1265,6 +1307,30 @@ mod tests {
         assert_eq!(serves("/img/logo.png").as_deref(), Some("logo"), "a linked file");
         assert_eq!(serves("/assets/app.js").as_deref(), Some("go()"), "a linked folder");
         assert!(!served.join("private.txt").exists(), "a link out of the site isn't copied");
+    }
+
+    /// A link named unlike the file it leads to is served as that file's kind, as the preview
+    /// serves it, not as an unknown file.
+    #[cfg(unix)]
+    #[test]
+    fn a_websites_pin_serves_a_link_named_unlike_its_file_as_that_files_kind() {
+        use std::os::unix::fs::symlink;
+        let d = tempfile::tempdir().unwrap();
+        let ws = Workspace::create(d.path(), "Site", "a page", TargetRef::None).unwrap();
+        let dist = ws.app_dir().join("dist");
+        std::fs::create_dir_all(dist.join("build")).unwrap();
+        std::fs::write(dist.join("index.html"), "<h1>site</h1>").unwrap();
+        std::fs::write(dist.join("build/app.js"), "go()").unwrap();
+        symlink("build/app.js", dist.join("main")).unwrap();
+        symlink("build", dist.join("assets")).unwrap();
+        symlink("app.js", dist.join("build/latest")).unwrap();
+
+        let pin = create(&ws, PinMode::Frozen, None, None, &mut |_, _| true).unwrap();
+        let served = std::fs::canonicalize(pin.app_dir(&ws)).unwrap();
+        let file = |path: &str| craft_anything_platform::serve::resolve(&served, path).unwrap();
+        assert_eq!(file("/main"), served.join("build/app.js"), "served as the .js file it leads to");
+        assert_eq!(file("/assets/latest"), served.join("build/app.js"), "from inside a linked folder too");
+        assert_eq!(std::fs::read_to_string(file("/main")).unwrap(), "go()");
     }
 
     /// What a site's copy leaves out stays out through a link, and a link back up the site doesn't
