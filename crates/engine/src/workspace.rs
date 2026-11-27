@@ -626,7 +626,40 @@ pub const ACTIVITY_LOG_OLD: &str = "build-activity.old.log";
 pub const USAGE_FILE: &str = "usage.json";
 /// Where [`ProjectUsage::reset`] moves an unreadable [`USAGE_FILE`], kept for the person to look at.
 pub const USAGE_SET_ASIDE: &str = "usage.unreadable.json";
-pub const USAGE_VERSION: u32 = 1;
+/// The current `usage.json` format version. Bumping it means appending a step to [`USAGE_STEPS`].
+pub const USAGE_VERSION: u32 = 2;
+/// The steps that bring an older `usage.json` forward; step `i` goes from version `i` to `i + 1`.
+const USAGE_STEPS: &[versioned::Step<Value>] = &[usage_v0_to_v1, usage_v1_to_v2];
+const _: () = assert!(USAGE_STEPS.len() == USAGE_VERSION as usize, "one step per usage.json version");
+
+/// Version 0 (no `version` field) has the same shape as version 1; only the number is new.
+fn usage_v0_to_v1(doc: &mut Value) -> Result<(), String> {
+    if doc.is_object() { Ok(()) } else { Err("usage.json isn't a JSON object".into()) }
+}
+
+/// Version 2 adds `restarted`. The number is new so an older build, which would drop it when it
+/// saves (the figures would then show as the whole), refuses the record as newer instead. A
+/// `restarted` an early build of this change already wrote at version 1 is kept.
+fn usage_v1_to_v2(doc: &mut Value) -> Result<(), String> {
+    let obj = doc.as_object_mut().ok_or("usage.json isn't a JSON object")?;
+    obj.entry("restarted").or_insert(Value::Bool(false));
+    Ok(())
+}
+
+/// Read a `usage.json` document of any version this build understands. A newer one is read as far
+/// as its fields are known and keeps its version, so [`ProjectUsage::update`] refuses to write it.
+fn read_usage(bytes: &[u8]) -> Option<ProjectUsage> {
+    let mut doc: Value = serde_json::from_slice(bytes).ok()?;
+    let found = match doc.get("version") {
+        None => 0,
+        Some(v) => v.as_u64().and_then(|n| u32::try_from(n).ok())?,
+    };
+    if found <= USAGE_VERSION {
+        let reached = upgrade(&mut doc, found, 0, USAGE_STEPS).ok()?;
+        doc.as_object_mut()?.insert("version".into(), Value::from(reached));
+    }
+    serde_json::from_value(doc).ok()
+}
 /// A build's turn and a question can record their cost at the same time. The save is
 /// read-modify-write, so both go through one lock or one would overwrite the other.
 static USAGE_UPDATE: Mutex<()> = Mutex::new(());
@@ -671,7 +704,7 @@ impl ProjectUsage {
             }
             Err(e) if e.code == ErrorCode::NotFound => UsageRead::None,
             Err(_) => UsageRead::Unreadable,
-            Ok(bytes) => serde_json::from_slice(&bytes).map_or(UsageRead::Unreadable, UsageRead::Known),
+            Ok(bytes) => read_usage(&bytes).map_or(UsageRead::Unreadable, UsageRead::Known),
         }
     }
 
@@ -1767,6 +1800,36 @@ mod tests {
         ProjectUsage::update(dir.path(), |u| u.work_ms = 5).unwrap();
         let u = ProjectUsage::read(dir.path()).known().unwrap();
         assert!(u.restarted && u.tokens_incomplete && u.work_ms == 5, "{u:?}");
+    }
+
+    /// #2212 review: a restarted record stayed version 1, which a build from before `restarted`
+    /// accepts and saves without the field. It is now saved at a version such a build refuses.
+    #[test]
+    fn a_version_1_usage_record_is_saved_at_the_current_version_and_keeps_restarted() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let on_disk = || serde_json::from_slice::<Value>(&std::fs::read(root.join(USAGE_FILE)).unwrap()).unwrap();
+
+        std::fs::write(root.join(USAGE_FILE), br#"{"version":1,"work_ms":7,"cost_usd":2.0,"priced":true}"#).unwrap();
+        let u = ProjectUsage::read(root).known().unwrap();
+        assert!(u.work_ms == 7 && u.priced && !u.restarted, "a version 1 record reads as it was: {u:?}");
+        ProjectUsage::update(root, |u| u.work_ms += 1).unwrap();
+        let saved = on_disk();
+        assert!(saved["version"].as_u64().is_some_and(|v| v > 1), "an older build that reads up to 1 refuses it: {saved}");
+        assert_eq!((saved["work_ms"].as_u64(), saved["restarted"].as_bool()), (Some(8), Some(false)));
+
+        // Written restarted at version 1 by #2212 before the number moved: the mark survives.
+        std::fs::write(root.join(USAGE_FILE), br#"{"version":1,"work_ms":3,"tokens_incomplete":true,"restarted":true}"#).unwrap();
+        assert!(ProjectUsage::read(root).known().is_some_and(|u| u.restarted && u.tokens_incomplete));
+        ProjectUsage::update(root, |u| u.work_ms += 1).unwrap();
+        assert_eq!(on_disk()["restarted"].as_bool(), Some(true), "still marked after the step");
+
+        // A record newer than this build is read as far as it's known and never written over.
+        let newer = format!(r#"{{"version":{},"work_ms":9,"restarted":true}}"#, USAGE_VERSION + 1);
+        std::fs::write(root.join(USAGE_FILE), &newer).unwrap();
+        assert!(ProjectUsage::read(root).known().is_some_and(|u| u.restarted && u.work_ms == 9));
+        assert!(ProjectUsage::update(root, |u| u.work_ms = 0).is_err());
+        assert_eq!(std::fs::read_to_string(root.join(USAGE_FILE)).unwrap(), newer, "left as it was");
     }
 
     /// A build turn and a question can save their cost together: neither may overwrite the other.
