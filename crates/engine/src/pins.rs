@@ -16,10 +16,11 @@
 //! were; only a file rewritten in place changes in both. Programs a pin or Play started are kept
 //! in [`Runs`], one at a time per folder unless another is asked for.
 //!
-//! A media file with the same bytes as one in an earlier frozen pin is copied from that pin's file
-//! rather than from the project's. Each pin keeps a file of its own, so writing to one never
-//! changes another; where copying clones (APFS on macOS, and Btrfs or XFS, which can serve Linux's
-//! `copy_file_range` as a reflink) the two share their blocks until one is written to.
+//! Where copies clone (APFS on macOS, Btrfs or XFS on Linux, ReFS on Windows), a media file with
+//! the same bytes as one in an earlier frozen pin is copied from that pin's file rather than from
+//! the project's, so the two share their blocks until one is written to; each pin still keeps a
+//! file of its own, so writing to one never changes another. Elsewhere (NTFS, ext4) the match
+//! would only read each file again and save nothing, so it isn't made.
 //!
 //! A pin of a **website** copies the built site (`dist/`, `build/`, `out/` or the app itself) into
 //! `app/`, and opening it serves that copy on a loopback port of its own ([`Sites`]).
@@ -607,7 +608,7 @@ pub fn create(ws: &Workspace, mode: PinMode, name: Option<&str>, godot: Option<&
     };
     let made = (|| {
         let files = planned(ws, &built, &pin.app_dir(ws))?;
-        let pinned = PinnedMedia::of(ws);
+        let pinned = if craft_anything_platform::fs::clones_in(&ws.root.join(PINNED)) { PinnedMedia::of(ws) } else { PinnedMedia::default() };
         (pin.bytes, pin.shared_bytes, pin.copied_shared_bytes) = copy_files(&files, mode, &pinned, progress, &|from, to| std::fs::hard_link(from, to))?;
         // Only copies are made here, and a copy's program is looked for inside it, where no
         // Cargo environment applies.
@@ -646,7 +647,7 @@ fn copy_linking(
 }
 
 /// Media already in the project's frozen pins, by size, so a new pin copies a file with the same
-/// bytes from there (see the module docs). Only frozen pins: a light pin's media are the project's
+/// bytes from there where copies clone (see the module docs). Only frozen pins: a light pin's media are the project's
 /// own files, which a rebuild may rewrite.
 #[derive(Default)]
 struct PinnedMedia(HashMap<u64, Vec<(PathBuf, LazyDigest)>>);
@@ -720,7 +721,7 @@ fn copy_files(
         } else {
             // Never a link to another pin's file: a frozen pin's copy is its own.
             let same = if f.shared && media(&f.from) { pinned.same_as(&f.from, f.len) } else { None };
-            let from_pin = same.is_some_and(|(pinned, wanted)| std::fs::copy(pinned, &f.to).is_ok() && digest(&f.to) == Some(wanted));
+            let from_pin = same.is_some_and(|(pinned, wanted)| copy_from_pin(pinned, &f.to, wanted));
             if !from_pin {
                 std::fs::copy(&f.from, &f.to).map_err(|e| {
                     ToolError::io(f.from.display(), e)
@@ -751,6 +752,20 @@ fn symlink_file(target: &Path, link: &Path) -> std::io::Result<()> {
 #[cfg(not(any(unix, windows)))]
 fn symlink_file(_: &Path, _: &Path) -> std::io::Result<()> {
     Err(std::io::ErrorKind::Unsupported.into())
+}
+
+/// Copy `pinned` to `to` if the copy holds `wanted`; otherwise nothing is left at `to`, so the
+/// project's file can be copied there instead.
+fn copy_from_pin(pinned: &Path, to: &Path, wanted: [u8; 32]) -> bool {
+    let copied = craft_anything_platform::fs::clone_or_copy(pinned, to).is_ok()
+        && digest(to) == Some(wanted);
+    if !copied
+        && let Err(e) = std::fs::remove_file(to)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        log::debug!("couldn't remove {}: {e}", to.display());
+    }
+    copied
 }
 
 /// Give a pin a new name.
