@@ -693,8 +693,9 @@ fn digest(p: &Path) -> Option<[u8; 32]> {
 
 /// Copy `files`; what it took and what a light pin shares with the project. A file that can't be
 /// linked (a drive without hard links, a file with as many as it can have) is copied. A media file
-/// equal to one in `pinned` is copied from there, and again from the project when the copy turns
-/// out to hold other bytes (that file changed after it was read).
+/// equal to one in `pinned` is copied from there, with the project file's permissions, and again
+/// from the project when the copy turns out to hold other bytes (that file changed after it was
+/// read).
 fn copy_files(
     files: &[Planned],
     mode: PinMode,
@@ -721,7 +722,7 @@ fn copy_files(
         } else {
             // Never a link to another pin's file: a frozen pin's copy is its own.
             let same = if f.shared && media(&f.from) { pinned.same_as(&f.from, f.len) } else { None };
-            let from_pin = same.is_some_and(|(pinned, wanted)| copy_from_pin(pinned, &f.to, wanted));
+            let from_pin = same.is_some_and(|(pinned, wanted)| copy_from_pin(pinned, &f.from, &f.to, wanted));
             if !from_pin {
                 std::fs::copy(&f.from, &f.to).map_err(|e| {
                     ToolError::io(f.from.display(), e)
@@ -754,11 +755,12 @@ fn symlink_file(_: &Path, _: &Path) -> std::io::Result<()> {
     Err(std::io::ErrorKind::Unsupported.into())
 }
 
-/// Copy `pinned` to `to` if the copy holds `wanted`; otherwise nothing is left at `to`, so the
-/// project's file can be copied there instead.
-fn copy_from_pin(pinned: &Path, to: &Path, wanted: [u8; 32]) -> bool {
+/// Copy `pinned` to `to` with the permissions of `from`, the project's file, if the copy holds
+/// `wanted`; otherwise nothing is left at `to`, so the project's file can be copied there instead.
+fn copy_from_pin(pinned: &Path, from: &Path, to: &Path, wanted: [u8; 32]) -> bool {
     let copied = craft_anything_platform::fs::clone_or_copy(pinned, to).is_ok()
-        && digest(to) == Some(wanted);
+        && digest(to) == Some(wanted)
+        && std::fs::metadata(from).and_then(|m| std::fs::set_permissions(to, m.permissions())).is_ok();
     if !copied
         && let Err(e) = std::fs::remove_file(to)
         && e.kind() != std::io::ErrorKind::NotFound
@@ -1317,6 +1319,25 @@ mod tests {
         let files = Plan::new(&ws, &app, true).files(&ws, &to).unwrap();
         copy_files(&files, PinMode::Frozen, &pinned, &mut |_, _| true, &|from, to| std::fs::hard_link(from, to)).unwrap();
         assert_eq!(std::fs::read(to.join("assets/sky.png")).unwrap(), vec![7u8; 4096], "the project's bytes");
+    }
+
+    /// A file copied from an earlier pin gets the project file's permissions, not that pin's.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_copied_from_an_earlier_pin_keeps_the_projects_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let ws = built(d.path());
+        let app = ws.app_dir();
+        let sky = app.join("assets/sky.png");
+        std::fs::write(&sky, vec![7u8; 4096]).unwrap();
+        let first = create(&ws, PinMode::Frozen, None, None, &mut |_, _| true).unwrap();
+        std::fs::set_permissions(first.app_dir(&ws).join("assets/sky.png"), std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(&sky, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let to = d.path().join("pin-copy");
+        let files = Plan::new(&ws, &app, true).files(&ws, &to).unwrap();
+        copy_files(&files, PinMode::Frozen, &PinnedMedia::of(&ws), &mut |_, _| true, &|from, to| std::fs::hard_link(from, to)).unwrap();
+        assert_eq!(std::fs::metadata(to.join("assets/sky.png")).unwrap().permissions().mode() & 0o777, 0o644);
     }
 
     #[test]
