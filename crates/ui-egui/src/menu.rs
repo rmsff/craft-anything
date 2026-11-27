@@ -195,9 +195,15 @@ pub fn feed(app: &mut CraftApp, ctx: &egui::Context, input: &mut egui::RawInput)
             None => {}
         }
     }
-    // Cmd as last seen: still held when a shortcut, not the mouse, picked the item.
-    let command = ctx.input(|i| i.modifiers.command);
+    let command = command_held(ctx, input);
     insert(&mut input.events, &edits, command, clipboard_text);
+}
+
+/// Cmd was held for the frame about to start: a shortcut, not the mouse, picked the item. The last
+/// pass's state alone misses a Cmd pressed since, together with the shortcut, which only `input`'s
+/// modifier changes show (egui 0.36's `RawInput` carries no modifier state of its own).
+fn command_held(ctx: &egui::Context, input: &egui::RawInput) -> bool {
+    ctx.input(|i| i.modifiers.command) || input.events.iter().any(|e| matches!(e, egui::Event::ModifiersChanged(m) if m.command))
 }
 
 /// Puts what `edits`' shortcuts send through egui-winit ahead of the frame's events, in the order
@@ -284,7 +290,7 @@ pub fn update(app: &mut CraftApp, ctx: &egui::Context) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Edit, insert};
+    use super::{Edit, command_held, insert};
     use egui_kittest::kittest::Queryable as _;
 
     /// A text box shown each frame; `.1` counts the frames that asked for a pasted picture.
@@ -361,6 +367,24 @@ mod tests {
         h.input_mut().events.push(release);
         h.run();
         assert_eq!(h.state().1, 1, "the picture is looked for");
+    }
+
+    /// Cmd and the Paste shortcut can both arrive between two frames, while the last frame saw no
+    /// Cmd. Taken for a mouse pick, the paste got a V release of its own, which cleared the pasted
+    /// text's mark, and the real release then asked for a picture as well.
+    #[test]
+    fn a_shortcut_and_its_cmd_in_one_frame_are_the_keyboards() {
+        let mut h = text_box("");
+        let cmd = egui::Modifiers::MAC_CMD | egui::Modifiers::COMMAND;
+        h.input_mut().events.push(egui::Event::ModifiersChanged(cmd));
+        let command = command_held(&h.ctx, h.input());
+        insert(&mut h.input_mut().events, &[Edit::Paste], command, || Some("hi".to_owned()));
+        h.step();
+        let release = egui::Event::Key { key: egui::Key::V, physical_key: None, pressed: false, repeat: false, modifiers: cmd };
+        h.input_mut().events.push(release);
+        h.run();
+        assert_eq!(h.state().0, "hi");
+        assert_eq!(h.state().1, 0, "no picture is looked for");
     }
 
     /// Edits picked before one frame run in the order they were picked.
