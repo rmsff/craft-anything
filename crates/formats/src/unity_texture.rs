@@ -255,6 +255,8 @@ fn decode_crunched(block_bytes: u32, width: u32, height: u32, data: &[u8]) -> Re
     // A stopgap until a crunch reader checks its input (docs/ROADMAP.md, R3.9): the decoder
     // indexes by the header's offsets and by codes read from the stream without checking them, so
     // a damaged stream panics inside it; that is caught here and reported like any malformed data.
+    // The panic hook still runs before the catch, so the desktop app's log (desktop.log) records
+    // it as "panic: …" from texture2ddecoder: that line is this refused texture, not a crash.
     let decoded = std::panic::catch_unwind(|| {
         let mut info = texture2ddecoder::CrnTextureInfo::default();
         if !info.crnd_get_texture_info(data, len) {
