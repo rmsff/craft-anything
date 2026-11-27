@@ -41,13 +41,21 @@ pub const PIN_FILE: &str = "pin.json";
 /// Where a pin keeps a program it copied from outside the app (a moved Cargo target directory).
 const PIN_PROGRAM: &str = "pin-program";
 /// The current `pin.json` format version.
-pub const PIN_VERSION: u32 = 2;
+pub const PIN_VERSION: u32 = 3;
 /// Version 2 remembers the program selected for an argument-free launch inside the copied app.
-const PIN_STEPS: &[versioned::Step<Value>] = &[pin_v1_to_v2];
+/// Version 3 marks a website's pin (`site`): a build that doesn't know it would take the pin for
+/// a program and save it as one.
+const PIN_STEPS: &[versioned::Step<Value>] = &[pin_v1_to_v2, pin_v2_to_v3];
 
 fn pin_v1_to_v2(doc: &mut Value) -> Result<(), String> {
     let object = doc.as_object_mut().ok_or_else(|| "a pin must be an object".to_string())?;
     object.insert("program".into(), Value::Null);
+    Ok(())
+}
+
+fn pin_v2_to_v3(doc: &mut Value) -> Result<(), String> {
+    let object = doc.as_object_mut().ok_or_else(|| "a pin must be an object".to_string())?;
+    object.insert("site".into(), Value::Bool(false));
     Ok(())
 }
 const _: () = assert!(PIN_STEPS.len() as u32 + 1 == PIN_VERSION, "one step per pin.json version after the first");
@@ -1343,6 +1351,9 @@ mod tests {
         let newer = read_pin(br#"{"version":9,"id":2,"name":"A","mode":"frozen","created_ms":5,"colour":"red"}"#).unwrap();
         assert_eq!(newer.version, 9, "a newer pin keeps its version");
         assert!(read_pin(b"[]").is_err());
+        let program = read_pin(br#"{"version":2,"id":4,"name":"A","mode":"frozen","created_ms":5,"program":"snake"}"#).unwrap();
+        assert_eq!((program.version, program.site), (PIN_VERSION, false), "a version 2 pin is a program's");
+        assert_eq!(program.program.as_deref(), Some(Path::new("snake")), "the step keeps what version 2 recorded");
         for bad in ["4294967296", "-1", "\"2\"", "null", "1.5"] {
             let text = format!(r#"{{"version":{bad},"id":2,"name":"A","mode":"frozen","created_ms":5}}"#);
             assert!(read_pin(text.as_bytes()).is_err(), "version {bad} isn't read as version 1");
