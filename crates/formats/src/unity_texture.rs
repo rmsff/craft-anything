@@ -269,7 +269,8 @@ fn decode_crunched(block_bytes: u32, width: u32, height: u32, data: &[u8]) -> Re
         if decoded_width != width {
             // The header's width is the big-endian 16 bits at offset 12; the decoder doesn't check its CRC.
             let wide = u16::try_from(decoded_width).map_err(|_| "it is too wide to decode")?;
-            stream.to_mut()[12..14].copy_from_slice(&wide.to_be_bytes());
+            let header_width = stream.to_mut().get_mut(12..14).ok_or("its header is too short")?;
+            header_width.copy_from_slice(&wide.to_be_bytes());
         }
         let mut image = vec![0u32; decoded_bytes / 4];
         texture2ddecoder::decode_unity_crunch(&stream, decoded_width as usize, height as usize, &mut image).map(|()| image)
