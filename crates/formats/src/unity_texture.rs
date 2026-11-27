@@ -232,7 +232,15 @@ pub fn mip0_size(format: i32, width: u32, height: u32) -> Option<usize> {
     pixels::size(layout(format)?, width, height)
 }
 
+/// Where a panic aborts (the web viewer's `web-release` build) a panic inside the crunch decoder
+/// can't be caught, and it is what a damaged stream causes, so crunched textures aren't decoded.
+#[cfg(panic = "abort")]
+fn decode_crunched(_block_bytes: u32, _width: u32, _height: u32, _data: &[u8]) -> Result<Vec<u8>, FormatError> {
+    Err(FormatError::Unsupported("crunched textures in this build".into()))
+}
+
 /// Decode a crunched stream's full-size picture into RGBA, rows in stored order.
+#[cfg(not(panic = "abort"))]
 fn decode_crunched(block_bytes: u32, width: u32, height: u32, data: &[u8]) -> Result<Vec<u8>, FormatError> {
     let too_large = || FormatError::TooLarge(format!("a {width}×{height} RGBA picture"));
     pixels::size(Layout::Rgba32, width, height).filter(|n| *n as u64 <= pixels::DEFAULT_MAX_RGBA_BYTES).ok_or_else(too_large)?;
@@ -244,8 +252,9 @@ fn decode_crunched(block_bytes: u32, width: u32, height: u32, data: &[u8]) -> Re
     let blocks_x = width.div_ceil(4);
     let decoded_width = if blocks_x.is_multiple_of(2) { width } else { (blocks_x + 1) * 4 };
     let decoded_bytes = pixels::size(Layout::Rgba32, decoded_width, height).ok_or_else(too_large)?;
-    // The decoder indexes the stream by the offsets its header gives without checking them, so a
-    // damaged stream panics inside it; that is caught here and reported like any malformed data.
+    // A stopgap until a crunch reader checks its input (docs/ROADMAP.md, R3.9): the decoder
+    // indexes by the header's offsets and by codes read from the stream without checking them, so
+    // a damaged stream panics inside it; that is caught here and reported like any malformed data.
     let decoded = std::panic::catch_unwind(|| {
         let mut info = texture2ddecoder::CrnTextureInfo::default();
         if !info.crnd_get_texture_info(data, len) {
