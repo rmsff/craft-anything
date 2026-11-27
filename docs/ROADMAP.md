@@ -448,6 +448,12 @@ Every round spends the person's money or quota. One that can't do anything shoul
       the person moved the file. A retry now carries on when `usage.unreadable.json` has the same
       bytes as `usage.json`. Unit test of the retry (#2212 review)
       — #2493; claimed: rmsff, branch bugfix/r5.3-usage-reset-follow-up
+- [x] On a drive without hard links, a reset checked that no record was set aside and then
+      renamed `usage.json` over the name, so a second Craft Anything resetting in between could
+      replace the set-aside record. It now creates `usage.unreadable.json` only where nothing is
+      (`create_new`), copies the record into it and then replaces `usage.json`. Unit test with
+      linking made to fail (#2212 review)
+      — #2493; claimed: rmsff, branch bugfix/r5.3-usage-reset-follow-up
 - [x] Show what the last run used next to Try again. `usage.json` keeps project totals only
       (time, tokens, `cost_usd`, `api_billed_usd`); the activity log has each turn's tokens but
       no cost, since a resumed agent's figure can't be tied to one turn (`activity.rs`). Show

@@ -654,6 +654,18 @@ fn same_bytes(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// Copy `from` into a new file `to`, created only where nothing is, so a file already there is
+/// never replaced. A copy that fails part-way is removed.
+fn copy_new(from: &Path, to: &Path) -> std::io::Result<()> {
+    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(to)?;
+    let copied = std::fs::File::open(from).and_then(|mut source| std::io::copy(&mut source, &mut file)).and_then(|_| file.sync_all());
+    if copied.is_err() {
+        drop(file);
+        let _ = std::fs::remove_file(to);
+    }
+    copied
+}
+
 /// Read a `usage.json` document of any version this build understands. A newer one is read as far
 /// as its fields are known and keeps its version, so [`ProjectUsage::update`] refuses to write it.
 fn read_usage(bytes: &[u8]) -> Option<ProjectUsage> {
@@ -737,6 +749,12 @@ impl ProjectUsage {
     /// project's runs are counted once more. A readable file is never replaced. The new record is
     /// `restarted`, and its token counts are lower bounds, since what the old one held isn't known.
     pub fn reset(root: &Path) -> Result<PathBuf, ToolError> {
+        ProjectUsage::reset_linking(root, &|from, to| std::fs::hard_link(from, to))
+    }
+
+    /// `reset`, with the way the record is linked given as a parameter, so a test can make linking
+    /// fail without needing a drive that can't link.
+    fn reset_linking(root: &Path, link: &dyn Fn(&Path, &Path) -> std::io::Result<()>) -> Result<PathBuf, ToolError> {
         let _updating = USAGE_UPDATE.lock().unwrap_or_else(PoisonError::into_inner);
         if !ProjectUsage::read(root).is_unreadable() {
             return Err(ToolError::invalid(format!("{USAGE_FILE} can be read, so it isn't set aside.")));
@@ -748,15 +766,23 @@ impl ProjectUsage {
         };
         // An earlier set-aside record is the only copy of what it held, and another Craft Anything
         // may be setting this one aside too: a hard link is made only where nothing is, so neither
-        // ever replaces it (a rename would, on Unix). The new record then replaces usage.json.
-        match std::fs::hard_link(&usage, &aside) {
+        // ever replaces it (a rename would, on Unix). On a drive without hard links a copy is made
+        // the same way. The new record then replaces usage.json.
+        let set_aside = match link(&usage, &aside) {
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(e),
+            Err(_) if std::fs::symlink_metadata(&usage).is_ok_and(|m| m.is_file()) => copy_new(&usage, &aside),
+            // Anything else in its place (a folder) can't be copied: checked, then moved. It holds
+            // no record, and on Unix a folder isn't renamed over a file.
+            Err(_) if std::fs::symlink_metadata(&aside).is_ok() => Err(std::io::ErrorKind::AlreadyExists.into()),
+            Err(_) => std::fs::rename(&usage, &aside),
+            Ok(()) => Ok(()),
+        };
+        match set_aside {
             Ok(()) => {}
             // An earlier reset stopped after setting this same record aside: it carries on.
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && same_bytes(&usage, &aside) => {}
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Err(already()),
-            // A drive without hard links: checked, then moved.
-            Err(_) if std::fs::symlink_metadata(&aside).is_ok() => return Err(already()),
-            Err(_) => std::fs::rename(&usage, &aside).map_err(|e| ToolError::io(usage.display(), e))?,
+            Err(e) => return Err(ToolError::io(usage.display(), e)),
         }
         let json = serde_json::to_vec_pretty(&ProjectUsage::restarted()).map_err(|e| ToolError::internal(e.to_string()))?;
         write_atomic(&usage, &json)?;
@@ -1824,6 +1850,26 @@ mod tests {
         let fresh = ProjectUsage::read(root).known().unwrap();
         assert!(fresh.restarted && fresh.tokens_incomplete, "{fresh:?}");
         assert_eq!(std::fs::read(root.join(USAGE_SET_ASIDE)).unwrap(), b"{ not json", "the set-aside record is kept as it was");
+    }
+
+    /// #2212 review: without hard links, reset checked that nothing was set aside and then renamed
+    /// over it, so a second Craft Anything in between could replace the set-aside record.
+    #[test]
+    fn without_hard_links_a_reset_copies_the_record_and_never_replaces_one_set_aside() {
+        let no_links = |_: &Path, _: &Path| Err(std::io::Error::other("no hard links here"));
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join(USAGE_FILE), b"{ not json").unwrap();
+        assert_eq!(ProjectUsage::reset_linking(root, &no_links).unwrap(), root.join(USAGE_SET_ASIDE));
+        assert_eq!(std::fs::read(root.join(USAGE_SET_ASIDE)).unwrap(), b"{ not json", "copied as it was");
+        assert!(ProjectUsage::read(root).known().is_some_and(|u| u.restarted), "counting starts again");
+
+        // Another record set aside already: this one is refused and neither changes.
+        std::fs::write(root.join(USAGE_FILE), b"").unwrap();
+        let refused = ProjectUsage::reset_linking(root, &no_links).unwrap_err();
+        assert!(refused.message.contains(USAGE_SET_ASIDE), "{refused:?}");
+        assert_eq!(std::fs::read(root.join(USAGE_SET_ASIDE)).unwrap(), b"{ not json", "the earlier record is kept");
+        assert_eq!(std::fs::read(root.join(USAGE_FILE)).unwrap(), b"", "left as it was");
     }
 
     /// #2212 review: a restarted record stayed version 1, which a build from before `restarted`
