@@ -387,6 +387,21 @@ mod tests {
         assert_eq!(h.state().1, 0, "no picture is looked for");
     }
 
+    /// Cmd+V pressed and let go entirely between two frames: Cmd is already up again, but the
+    /// frame's own modifier changes still show it went down, so the paste is the keyboard's.
+    #[test]
+    fn a_shortcut_pressed_and_released_between_frames_is_the_keyboards() {
+        let mut h = text_box("");
+        let cmd = egui::Modifiers::MAC_CMD | egui::Modifiers::COMMAND;
+        let release = egui::Event::Key { key: egui::Key::V, physical_key: None, pressed: false, repeat: false, modifiers: cmd };
+        h.input_mut().events.extend([egui::Event::ModifiersChanged(cmd), release, egui::Event::ModifiersChanged(egui::Modifiers::NONE)]);
+        let command = command_held(&h.ctx, h.input());
+        insert(&mut h.input_mut().events, &[Edit::Paste], command, || Some("hi".to_owned()));
+        h.run();
+        assert_eq!(h.state().0, "hi");
+        assert_eq!(h.state().1, 0, "no picture is looked for");
+    }
+
     /// Edits picked before one frame run in the order they were picked.
     #[test]
     fn edits_picked_in_one_frame_keep_their_order() {
