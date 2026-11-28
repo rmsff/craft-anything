@@ -546,6 +546,7 @@ mod tests {
             reads_checked: false,
             question: false,
             message_file,
+            run_dir: None,
         })
     }
 

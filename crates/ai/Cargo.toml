@@ -25,6 +25,7 @@ ureq = "3"
 # Pictures are sent to models as base64 (the same version the engine crate uses).
 base64 = "0.22"
 dirs = "6"
+yaml-rust2 = "0.10"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { version = "3", default-features = false, features = ["async-secret-service", "async-io", "crypto-rust"] }

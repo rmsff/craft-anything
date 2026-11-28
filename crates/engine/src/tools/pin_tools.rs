@@ -1,8 +1,9 @@
 //! Pinned builds as tools: pin a project's build (a frozen or light copy), list pins with what's
 //! running, open, stop, rename and remove them. Play shares their run list, so a program runs once
-//! per folder unless another copy is asked for. See `crate::pins`.
+//! per folder unless another copy is asked for. A pinned website is served instead. See
+//! `crate::pins`.
 
-use crate::pins::{self, Opened, PinMode, Runs};
+use crate::pins::{self, Opened, PinMode, Runs, Sites};
 use crate::tool::{Ctx, Effects, Requires, ToolOutput, ToolSpec, Toolset, parse_params, schema_of};
 use crate::workspace::Workspace;
 use craft_anything_evidence::{ErrorCode, ToolError};
@@ -18,7 +19,7 @@ pub fn specs() -> Vec<ToolSpec> {
         ToolSpec {
             id: "project_pin_create",
             title: "Pin a project's build",
-            summary: "Keep the project's current build at hand to open later, whatever the builder changes next. `frozen` (the default) copies the app's files and its program into the project's pinned/ folder, without compiler output or dependencies it doesn't start from, so rebuilds can't change or break it. `light` copies the program and the code too but hard-links dependencies and media to the project's, saving their space: replacing or deleting those in the project leaves the pin's as they were, but a file rewritten in place changes in both. With `estimate`, only says what each would take. Websites can't be pinned yet.",
+            summary: "Keep the project's current build at hand to open later, whatever the builder changes next. `frozen` (the default) copies the app's files and its program into the project's pinned/ folder, without compiler output or dependencies it doesn't start from, so rebuilds can't change or break it. `light` copies the program and the code too but hard-links dependencies and media to the project's, saving their space: replacing or deleting those in the project leaves the pin's as they were, but a file rewritten in place changes in both. With `estimate`, only says what each would take. A website's pin copies the built site (its media shared by a light pin).",
             beginner: "Keeps this version so you can always open it.",
             toolset: Toolset::Projects,
             effects: Effects::WRITES_FILESYSTEM,
@@ -29,7 +30,7 @@ pub fn specs() -> Vec<ToolSpec> {
         ToolSpec {
             id: "project_pins_list",
             title: "List pinned builds",
-            summary: "The pins of one project, or of every project in the project folders from settings: id, name, frozen or light, the round it was pinned at, its size, and whether it's running (started in this session).",
+            summary: "The pins of one project, or of every project in the project folders from settings: id, name, frozen or light, the round it was pinned at, its size, and whether it's running (started in this session; a website's pin also gives the address it's served at).",
             beginner: "Shows the versions you kept.",
             toolset: Toolset::Projects,
             effects: Effects::READ_ONLY,
@@ -40,7 +41,7 @@ pub fn specs() -> Vec<ToolSpec> {
         ToolSpec {
             id: "project_pin_open",
             title: "Open a pinned build",
-            summary: "Start a pinned build in its own window. If it's already running, says so instead of starting a second copy, unless `another` is true (copies of one pin share the files they save beside themselves). A start that quits within two seconds is reported with its exit code and last output. It runs the code the builder wrote, so it needs the person's consent.",
+            summary: "Start a pinned build in its own window; a pinned website is served from its copy on a loopback port of its own, and its address returned (`url`; `another` doesn't apply). The website is served for this session; with `wait`, the call itself serves it until it's cancelled (Ctrl+C in the CLI, whose session ends with the command). If it's already running, says so instead of starting a second copy, unless `another` is true (copies of one pin share the files they save beside themselves). A start that quits within two seconds is reported with its exit code and last output. It runs the code the builder wrote, so it needs the person's consent.",
             beginner: "Opens a version you kept.",
             toolset: Toolset::Projects,
             effects: Effects::LAUNCHES_PROCESS.union(Effects::EXECUTES_FOREIGN_CODE),
@@ -51,7 +52,7 @@ pub fn specs() -> Vec<ToolSpec> {
         ToolSpec {
             id: "project_pin_stop",
             title: "Stop a pinned build",
-            summary: "Close what a pin started in this session (every copy of it).",
+            summary: "Close what a pin started in this session (every copy of it), or stop serving a pinned website.",
             beginner: "Closes a version you opened.",
             toolset: Toolset::Projects,
             effects: Effects::MUTATES_SESSION,
@@ -128,6 +129,9 @@ pub struct OpenParams {
     /// Start another copy even if one is running.
     #[serde(default)]
     pub another: bool,
+    /// For a website, serve until the call is cancelled instead of returning at once (for the CLI).
+    #[serde(default)]
+    pub wait: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -176,6 +180,18 @@ pub(crate) fn runs(ctx: &mut Ctx<'_>) -> Arc<Runs> {
             let r = Arc::new(Runs::default());
             ctx.session.ext.insert(r.clone());
             r
+        }
+    }
+}
+
+/// This session's served pinned websites (made on first use).
+fn sites(ctx: &mut Ctx<'_>) -> Arc<Sites> {
+    match ctx.session.ext.get::<Sites>() {
+        Some(s) => s,
+        None => {
+            let s = Arc::new(Sites::default());
+            ctx.session.ext.insert(s.clone());
+            s
         }
     }
 }
@@ -249,19 +265,21 @@ fn project_pins_list(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, Too
         Some(dir) => vec![open_project(dir)?],
         None => Workspace::list_in(&ctx.session.settings.project_locations()),
     };
-    let runs = runs(ctx);
+    let (runs, sites) = (runs(ctx), sites(ctx));
     let mut out = Vec::new();
     let mut copied_bytes = 0u64;
     for ws in &projects {
         for pin in pins::list(ws) {
             copied_bytes = copied_bytes.saturating_add(pin.bytes);
             let running = runs.running(&pin.app_dir(ws));
+            let url = sites.url(&pin.app_dir(ws));
             out.push(json!({
                 "project": ws.root.display().to_string(),
                 "project_name": ws.manifest.name,
                 "pin": pin,
                 "folder": pin.dir(ws).display().to_string(),
-                "running": !running.is_empty(),
+                "running": !running.is_empty() || url.is_some(),
+                "url": url,
                 "pids": running.iter().map(|l| l.pid()).collect::<Vec<_>>(),
             }));
         }
@@ -273,6 +291,21 @@ fn project_pin_open(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, Tool
     let p: OpenParams = parse_params(params)?;
     let ws = open_project(&p.project)?;
     let pin = pins::get(&ws, p.pin)?;
+    if pin.site {
+        let (sites, dir) = (sites(ctx), pin.app_dir(&ws));
+        let (url, already_running) = sites.open(&dir)?;
+        if p.wait {
+            ctx.report(None, format!("Serving {url} (stop to end)"));
+            while !ctx.cancel.is_cancelled() {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            // What was served before this call keeps being served for whoever opened it.
+            if !already_running {
+                sites.stop(&dir);
+            }
+        }
+        return Ok(ToolOutput::Value(json!({"pin": pin.id, "already_running": already_running, "url": url})));
+    }
     let launch = pin.launch(&ws, godot(ctx).as_deref(), &ctx.session.cargo())?;
     let mut out = start_program(ctx, &pin.app_dir(&ws), &pin.log_path(&ws), p.another, &pin.name, launch)?;
     if let Some(o) = out.as_object_mut() {
@@ -285,7 +318,7 @@ fn project_pin_stop(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, Tool
     let p: PinParams = parse_params(params)?;
     let ws = open_project(&p.project)?;
     let pin = pins::get(&ws, p.pin)?;
-    let stopped = runs(ctx).stop(&pin.app_dir(&ws));
+    let stopped = runs(ctx).stop(&pin.app_dir(&ws)) + sites(ctx).stop(&pin.app_dir(&ws));
     Ok(ToolOutput::Value(json!({"pin": pin.id, "stopped": stopped})))
 }
 
@@ -303,7 +336,8 @@ fn project_pin_delete(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, To
     let ws = open_project(&p.project)?;
     let pin = pins::get(&ws, p.pin)?;
     // An old live pin runs the project's app: what's running there isn't the pin's to keep.
-    if pin.mode.keeps_copy() && !runs(ctx).running(&pin.app_dir(&ws)).is_empty() {
+    let served = sites(ctx).url(&pin.app_dir(&ws)).is_some();
+    if pin.mode.keeps_copy() && (served || !runs(ctx).running(&pin.app_dir(&ws)).is_empty()) {
         return Err(ToolError::invalid(format!("{} is open.", pin.name)).with_remediation("Close it (project_pin_stop), then remove it."));
     }
     pins::delete(&ws, p.pin)?;
@@ -435,6 +469,93 @@ mod tests {
         assert_eq!(list["count"], 1);
         assert_eq!(list["copied_bytes"], light["pin"]["bytes"]);
         assert_eq!(call("project_pin_open", json!({"project": ws.root, "pin": 1})).unwrap_err().code, ErrorCode::NotFound);
+    }
+
+    /// What a loopback server sends for `/` at `url`.
+    fn fetch(url: &str) -> String {
+        use std::io::{Read, Write};
+        let address = url.trim_start_matches("http://").trim_end_matches('/');
+        let mut stream = std::net::TcpStream::connect(address).unwrap();
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
+        stream.write_all(format!("GET / HTTP/1.1\r\nHost: {address}\r\n\r\n").as_bytes()).unwrap();
+        let mut out = String::new();
+        stream.read_to_string(&mut out).unwrap();
+        out
+    }
+
+    /// Each pinned website is served from its own copy on a port of its own, says so when it's
+    /// served already, can't be removed while served, and stops when asked.
+    #[test]
+    fn a_pinned_website_is_served_from_its_copy_on_a_port_of_its_own() {
+        let d = tempfile::tempdir().unwrap();
+        let ws = Workspace::create(d.path(), "Site", "a page", TargetRef::None).unwrap();
+        let dist = ws.app_dir().join("dist");
+        std::fs::create_dir_all(&dist).unwrap();
+        std::fs::write(dist.join("index.html"), "first build").unwrap();
+        let e = Engine::new(crate::testing::session());
+        let call = |id: &str, p: Value| e.call(id, p, CallOptions::new(Caller::Cli).with_consent(Consent::Granted)).map(|o| o.to_json()["result"].clone());
+
+        let first = call("project_pin_create", json!({"project": ws.root})).unwrap()["pin"]["id"].clone();
+        std::fs::write(dist.join("index.html"), "second build").unwrap();
+        let second = call("project_pin_create", json!({"project": ws.root})).unwrap()["pin"]["id"].clone();
+        std::fs::write(dist.join("index.html"), "the project now").unwrap();
+        let one = call("project_pin_open", json!({"project": ws.root, "pin": first})).unwrap();
+        let two = call("project_pin_open", json!({"project": ws.root, "pin": second})).unwrap();
+        assert_eq!(one["already_running"], false);
+        let (one_url, two_url) = (one["url"].as_str().unwrap(), two["url"].as_str().unwrap());
+        assert_ne!(one_url, two_url, "each pin is served on a port of its own");
+        assert!(fetch(one_url).ends_with("first build"));
+        assert!(fetch(two_url).ends_with("second build"));
+
+        let again = call("project_pin_open", json!({"project": ws.root, "pin": first})).unwrap();
+        assert_eq!((again["already_running"].as_bool(), again["url"].as_str()), (Some(true), Some(one_url)));
+        let list = call("project_pins_list", json!({"project": ws.root})).unwrap();
+        assert_eq!((list["pins"][0]["running"].as_bool(), list["pins"][0]["url"].as_str()), (Some(true), Some(one_url)));
+        assert!(call("project_pin_delete", json!({"project": ws.root, "pin": first, "confirm": true})).is_err(), "a served pin isn't removed");
+
+        assert_eq!(call("project_pin_stop", json!({"project": ws.root, "pin": first})).unwrap()["stopped"], 1);
+        let list = call("project_pins_list", json!({"project": ws.root})).unwrap();
+        assert_eq!(list["pins"][0]["running"], false);
+        assert!(list["pins"][0]["url"].is_null());
+        assert_eq!(list["pins"][1]["running"], true, "stopping one pin leaves the other served");
+        call("project_pin_delete", json!({"project": ws.root, "pin": first, "confirm": true})).unwrap();
+    }
+
+    /// A CLI run ends its session with the command, so `wait` keeps a pinned website served for
+    /// as long as the call goes on, and stops serving it once the call is cancelled.
+    #[test]
+    fn a_pinned_website_opened_with_wait_is_served_until_the_cli_call_is_cancelled() {
+        let d = tempfile::tempdir().unwrap();
+        let ws = Workspace::create(d.path(), "Site", "a page", TargetRef::None).unwrap();
+        let dist = ws.app_dir().join("dist");
+        std::fs::create_dir_all(&dist).unwrap();
+        std::fs::write(dist.join("index.html"), "pinned build").unwrap();
+        let e = Arc::new(Engine::new(crate::testing::session()));
+        let opts = || CallOptions::new(Caller::Cli).with_consent(Consent::Granted);
+        let pin = e.call("project_pin_create", json!({"project": ws.root}), opts()).unwrap().to_json()["result"]["pin"]["id"].clone();
+        let served = Arc::new(Sites::default());
+        e.session().ext.insert(served.clone());
+        let dir = pins::get(&ws, pin.as_u64().unwrap() as u32).unwrap().app_dir(&ws);
+
+        let cancel = crate::CancelToken::default();
+        let (engine, token, project) = (e.clone(), cancel.clone(), ws.root.clone());
+        let waiting = std::thread::spawn(move || {
+            engine.call("project_pin_open", json!({"project": project, "pin": pin, "wait": true}), opts().with_cancel(token)).map(|o| o.to_json())
+        });
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let url = loop {
+            if let Some(url) = served.url(&dir) {
+                break url;
+            }
+            assert!(std::time::Instant::now() < until, "it starts serving");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        assert!(fetch(&url).ends_with("pinned build"), "served while the call goes on");
+        assert!(!waiting.is_finished());
+        cancel.cancel();
+        let done = waiting.join().unwrap().unwrap();
+        assert_eq!(done["result"]["url"].as_str(), Some(url.as_str()));
+        assert!(served.url(&dir).is_none(), "serving stops with the call");
     }
 
     #[test]

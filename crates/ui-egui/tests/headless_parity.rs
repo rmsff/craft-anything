@@ -12,6 +12,17 @@
 //! - a pending tool that now exists fails the test, so its row is moved to `Tool`;
 //! - every `&mut self` method on `CraftApp` is either a row here or in [`PLUMBING`], so a new
 //!   method can't slip in without a decision.
+//!
+//! **RFC-0052.** This table is Craft Anything's parity report for
+//! [RFC-0052](https://github.com/storytold/craft-contrib/blob/main/rfcs/0052-headless-reach.md)'s
+//! `headless:` column, which it already carries in another shape. The mapping ([`rfc0052`]):
+//! `Tool` is `yes` (a registered tool, so the CLI and the MCP server both reach it), and so is a
+//! `Cli` row run through `tool <id>` (the CLI's door to the same registry). Any other `Cli` row
+//! is `partial` with `reach: engine-gap`: the CLI reaches it, but the MCP server lists only
+//! registered tools, so it waits for a tool. `Pending` is `no` with `reach: engine-gap` (a tool
+//! could do it; it isn't one yet), `UiOnly` is `no` with `reach: window` (a view action, nothing
+//! lost without the app). No row is `unknown`: every action must have a row. [`summary`] prints
+//! the counts.
 
 use craft_anything_engine::Registry;
 use std::path::{Path, PathBuf};
@@ -77,6 +88,7 @@ const ACTIONS: &[Action] = &[
     a("add_pictures",        "pictures of the original for the builder",       Tool(&["rebuild_start"])),
     a("attach",              "attach pictures to the next message",            Pending { tool: None, why: "rebuild_note and rebuild_start take text; attachments with a message come next" }),
     a("paste_pictures",      "attach pictures from the clipboard (Ctrl+V)",    UiOnly("the clipboard belongs to the app; headless callers name picture files")),
+    a("reset_usage",         "set an unreadable usage record aside and count a project's builds again", Tool(&["project_usage_reset"])),
     a("raise_asset_budget",  "give a project another default budget for generated assets", Tool(&["project_assets_budget"])),
     a("set_generate_assets", "let a game's builder generate pictures and 3D models, or not", Tool(&["project_assets_allow"])),
     a("Project › Open folder", "show the project folder in the file manager",  Tool(&["project_open_folder"])),
@@ -309,6 +321,36 @@ fn every_row_says_why_when_there_is_no_counterpart() {
     }
 }
 
+/// A CLI command that runs a registered tool (`tool <id> …`), which the MCP server lists too.
+fn is_tool_command(c: &str) -> bool {
+    c == "tool <id>" || c.starts_with("tool <id> ")
+}
+
+/// A row's RFC-0052 `(headless, reach)` (see the module docs).
+fn rfc0052(h: &Headless) -> (&'static str, Option<&'static str>) {
+    match h {
+        Tool(_) => ("yes", None),
+        Cli(c) if is_tool_command(c) => ("yes", None),
+        Cli(_) => ("partial", Some("engine-gap")),
+        Pending { .. } => ("no", Some("engine-gap")),
+        UiOnly(_) => ("no", Some("window")),
+    }
+}
+
+#[test]
+fn only_a_registered_tool_is_headless_yes() {
+    assert_eq!(rfc0052(&Tool(&["project_list"])), ("yes", None));
+    assert_eq!(rfc0052(&Cli("tool <id>")), ("yes", None));
+    assert_eq!(rfc0052(&Cli("tool <id> --allow-run")), ("yes", None));
+    assert_eq!(rfc0052(&Cli("ai on <name>")), ("partial", Some("engine-gap")));
+    assert_eq!(rfc0052(&Cli("toolbox")), ("partial", Some("engine-gap")));
+    assert_eq!(rfc0052(&Pending { tool: None, why: "x" }), ("no", Some("engine-gap")));
+    assert_eq!(rfc0052(&UiOnly("x")), ("no", Some("window")));
+    let yes = ACTIONS.iter().filter(|a| rfc0052(&a.headless).0 == "yes").count();
+    let tools = ACTIONS.iter().filter(|a| matches!(a.headless, Tool(_)) || matches!(a.headless, Cli(c) if is_tool_command(c))).count();
+    assert_eq!(yes, tools, "only a row that reaches a registered tool is yes");
+}
+
 /// Counts, for the PR and the roadmap: `cargo test -p craft-anything-ui-egui --test headless_parity -- --nocapture`.
 #[test]
 fn summary() {
@@ -321,4 +363,13 @@ fn summary() {
         }
     }
     println!("headless parity: {covered} covered, {pending} pending, {ui_only} UI-only ({} actions)", ACTIONS.len());
+    let count = |v: &str, r: Option<&str>| ACTIONS.iter().filter(|a| rfc0052(&a.headless) == (v, r)).count();
+    println!(
+        "RFC-0052: {} yes, {} no (window {}, os 0, engine-gap {}), {} partial, 0 unknown",
+        count("yes", None),
+        count("no", Some("window")) + count("no", Some("engine-gap")),
+        count("no", Some("window")),
+        count("no", Some("engine-gap")),
+        count("partial", Some("engine-gap"))
+    );
 }

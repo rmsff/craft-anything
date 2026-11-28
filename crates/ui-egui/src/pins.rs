@@ -140,7 +140,10 @@ impl CraftApp {
                 self.refresh_pins();
             }
             ("project_pin_open", Ok(v)) => {
-                if v["already_running"].as_bool() == Some(true) {
+                // A pinned website opens in the browser, whether or not it was served already.
+                if let Some(url) = v["url"].as_str() {
+                    self.open_url = Some(url.to_string());
+                } else if v["already_running"].as_bool() == Some(true) {
                     self.toast(tr("It's already open. Right-click it to open another copy."), false);
                 } else if !v["closed_at_once"].is_null() {
                     self.toast(quit_at_once(&v), true);
@@ -230,7 +233,13 @@ pub fn section(app: &mut CraftApp, ui: &mut Ui, fold: bool) {
 /// The right-click menu on a pin.
 fn menu(app: &mut CraftApp, ui: &mut Ui, row: &PinRow) {
     if row.running {
-        if widgets::menu_item(ui, false, tr("Open another copy")).on_hover_text(tr("Copies share the files it saves beside itself.")).clicked() {
+        // Another copy of a website would only serve the same files again.
+        if row.pin.site {
+            if widgets::menu_item(ui, false, tr("Open")).clicked() {
+                app.open_pin(row, false);
+                ui.close();
+            }
+        } else if widgets::menu_item(ui, false, tr("Open another copy")).on_hover_text(tr("Copies share the files it saves beside itself.")).clicked() {
             app.open_pin(row, true);
             ui.close();
         }
@@ -455,5 +464,18 @@ mod tests {
         app.state.pin_draft = draft("/projects/b");
         app.pin_done("project_pin_create", Ok(json!({"project": "/projects/b", "estimate": {"bytes": 10, "light_bytes": 5}})));
         assert!(app.state.pin_draft.size.is_none());
+    }
+
+    /// A pinned website opens at its address in the browser, also when it was served already,
+    /// instead of the message for a program that's already open.
+    #[test]
+    fn opening_a_pinned_website_opens_its_address() {
+        let mut app = app();
+        for already_running in [false, true] {
+            app.state.toasts.clear();
+            app.pin_done("project_pin_open", Ok(json!({"pin": 1, "already_running": already_running, "url": "http://127.0.0.1:4100/"})));
+            assert_eq!(app.open_url.take().as_deref(), Some("http://127.0.0.1:4100/"));
+            assert!(app.state.toasts.is_empty(), "{:?}", app.state.toasts);
+        }
     }
 }

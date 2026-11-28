@@ -131,26 +131,37 @@ fn own_build(app: &Path, tool: &stacks::Toolchain, stop: &CheckStop, env: &[(&st
     }
 }
 
-/// A person's own project: run its tests. Output that says none ran isn't a failure, and neither
-/// is a project we know no way to test, and the note says so.
-pub(super) fn own_tests_check(app: &Path, tool: Option<&stacks::Toolchain>, stop: &CheckStop, env: &[(&str, &OsStr)]) -> Result<(bool, String), ToolError> {
-    let Some(tool) = tool else { return Ok((true, "No tests ran: Craft Anything doesn't know how to test this kind of project.".into())) };
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum OwnTestsOutcome {
+    Passed,
+    Failed,
+    Skipped,
+}
+
+/// Run a person's own tests, distinguishing an intentional skip from a pass or failure.
+pub(super) fn own_tests_check(
+    app: &Path,
+    tool: Option<&stacks::Toolchain>,
+    stop: &CheckStop,
+    env: &[(&str, &OsStr)],
+) -> Result<(OwnTestsOutcome, String), ToolError> {
+    let Some(tool) = tool else { return Ok((OwnTestsOutcome::Skipped, "No tests ran: Craft Anything doesn't know how to test this kind of project.".into())) };
     let says_none = |text: &str| tool.no_tests.iter().find(|n| text.contains(n.as_str())).cloned();
     if let Some(name) = &tool.test_script {
         // shortcut: `workspaces=true` in .npmrc can give a root with no script tests; they aren't
         // run, and the note says so. Read .npmrc if that turns up.
         let script = craft_anything_engine::outputs::npm_script(app, name).unwrap_or_default();
         if script.is_empty() || tool.no_tests.iter().any(|n| n == script.trim()) {
-            return Ok((true, format!("No tests ran: package.json has no `{name}` script to run.")));
+            return Ok((OwnTestsOutcome::Skipped, format!("No tests ran: package.json has no `{name}` script to run.")));
         }
     }
     match run_tool(app, tool, &tool.test, 30, stop, env) {
-        Ok((true, _)) => Ok((true, format!("`{}` passed.", tool.test.join(" ")))),
+        Ok((true, _)) => Ok((OwnTestsOutcome::Passed, format!("`{}` passed.", tool.test.join(" ")))),
         Ok((false, out)) => match says_none(&out).filter(|_| tool.test_script.is_none()) {
-            Some(why) => Ok((true, format!("No tests ran: {}.", why.trim_end_matches('.')))),
-            None => Ok((false, format!("The project's tests failed:\n{}", last_lines(&out, 20)))),
+            Some(why) => Ok((OwnTestsOutcome::Skipped, format!("No tests ran: {}.", why.trim_end_matches('.')))),
+            None => Ok((OwnTestsOutcome::Failed, format!("The project's tests failed:\n{}", last_lines(&out, 20)))),
         },
-        Err(e) => step_error("tests", e),
+        Err(e) => step_error("tests", e).map(|(_, note)| (OwnTestsOutcome::Failed, note)),
     }
 }
 
@@ -368,13 +379,13 @@ func TestAnswer(t *testing.T) {
         let build = || own_build_check(app, "the project folder", stacks::BUILDERS_CHOICE, None, None, &stop, &env).unwrap();
         let test = || own_tests_check(app, Some(tool), &stop, &env).unwrap();
         assert_eq!(build(), (true, "`go build ./...` passed.".into()));
-        assert_eq!(test(), (true, "`go test ./...` passed.".into()));
+        assert_eq!(test(), (OwnTestsOutcome::Passed, "`go test ./...` passed.".into()));
         assert!(cache.join("README").is_file(), "Go's build cache is the test's own");
 
         std::fs::write(&tests, passing_test.replace("!= 42", "!= 43")).unwrap();
         assert!(build().0, "a test assertion must not fail the build");
-        let (passed, note) = test();
-        assert!(!passed && note.contains("unexpected answer"), "{note}");
+        let (outcome, note) = test();
+        assert!(outcome == OwnTestsOutcome::Failed && note.contains("unexpected answer"), "{note}");
 
         std::fs::write(app.join("main.go"), "package main\nfunc main(\n").unwrap();
         let (passed, note) = build();
@@ -386,17 +397,17 @@ func TestAnswer(t *testing.T) {
     fn a_persons_own_tests_decide_and_no_tests_is_no_failure() {
         let (d, stop) = (tempfile::tempdir().unwrap(), CheckStop::default());
         let tests = |tool: &stacks::Toolchain| own_tests_check(d.path(), Some(tool), &stop, &[]);
-        assert!(tests(&stand_in("exit 0", &[])).unwrap().0);
-        let (passed, note) = tests(&stand_in("echo 'adds: 4 is not 5'; echo; echo '1 failed'; exit 1", &[])).unwrap();
-        assert!(!passed && note.ends_with("adds: 4 is not 5\n1 failed"), "the summary, not only lines saying error: {note}");
-        let (passed, note) = tests(&stand_in("echo no tests here; exit 5", &["no tests here"])).unwrap();
-        assert!(passed && note.starts_with("No tests ran"), "{note}");
+        assert_eq!(tests(&stand_in("exit 0", &[])).unwrap().0, OwnTestsOutcome::Passed);
+        let (outcome, note) = tests(&stand_in("echo 'adds: 4 is not 5'; echo; echo '1 failed'; exit 1", &[])).unwrap();
+        assert!(outcome == OwnTestsOutcome::Failed && note.ends_with("adds: 4 is not 5\n1 failed"), "the summary, not only lines saying error: {note}");
+        let (outcome, note) = tests(&stand_in("echo no tests here; exit 5", &["no tests here"])).unwrap();
+        assert!(outcome == OwnTestsOutcome::Skipped && note.starts_with("No tests ran"), "{note}");
         let missing = stacks::Toolchain { test: vec!["no-such-program-here".into()], ..Default::default() };
         let err = tests(&missing).unwrap_err();
         assert_eq!(err.code, ErrorCode::EngineMissing, "{err:?}");
         assert!(err.message.starts_with("Couldn't run the tests"), "{err:?}");
-        let (passed, note) = own_tests_check(d.path(), None, &stop, &[]).unwrap();
-        assert!(passed && note.starts_with("No tests ran"), "{note}");
+        let (outcome, note) = own_tests_check(d.path(), None, &stop, &[]).unwrap();
+        assert!(outcome == OwnTestsOutcome::Skipped && note.starts_with("No tests ran"), "{note}");
     }
 
     #[cfg(unix)]
@@ -407,8 +418,8 @@ func TestAnswer(t *testing.T) {
         std::fs::write(d.path().join("own-sh.bat"), "not for this system").unwrap();
         let test = ["no-such-program-here", "-c", "echo 'error: from its own copy'; exit 1"].map(String::from).to_vec();
         let tool = stacks::Toolchain { test, local_programs: vec!["not-here".into(), "own-sh.bat".into(), "own-sh".into()], ..Default::default() };
-        let (passed, note) = own_tests_check(d.path(), Some(&tool), &stop, &[]).unwrap();
-        assert!(!passed && note.contains("from its own copy"), "{note}");
+        let (outcome, note) = own_tests_check(d.path(), Some(&tool), &stop, &[]).unwrap();
+        assert!(outcome == OwnTestsOutcome::Failed && note.contains("from its own copy"), "{note}");
     }
 
     /// The table's own words, on what the real make (3.81; 4.x quotes alike) and npm (11) print.
@@ -426,14 +437,18 @@ func TestAnswer(t *testing.T) {
             own_tests_check(d.path(), Some(&stacks::Toolchain { test, ..tool.clone() }), &stop, &[]).unwrap().0
         };
         let (make, node) = (named_by("Makefile"), named_by("package.json"));
-        assert!(printing(make, "make: *** No rule to make target `test'.  Stop."));
-        assert!(printing(make, "make: *** No rule to make target 'test'.  Stop."));
-        assert!(!printing(make, "make: *** No rule to make target `fixture.txt', needed by `test'.  Stop."), "a prerequisite is a failure");
-        assert!(!printing(make, "make: *** No rule to make target 'fixture.txt', needed by 'test'.  Stop."));
-        assert!(!printing(make, "make[1]: *** No rule to make target `test'.  Stop."), "a make it runs is a failure");
+        assert_eq!(printing(make, "make: *** No rule to make target `test'.  Stop."), OwnTestsOutcome::Skipped);
+        assert_eq!(printing(make, "make: *** No rule to make target 'test'.  Stop."), OwnTestsOutcome::Skipped);
+        assert_eq!(
+            printing(make, "make: *** No rule to make target `fixture.txt', needed by `test'.  Stop."),
+            OwnTestsOutcome::Failed,
+            "a prerequisite is a failure"
+        );
+        assert_eq!(printing(make, "make: *** No rule to make target 'fixture.txt', needed by 'test'.  Stop."), OwnTestsOutcome::Failed);
+        assert_eq!(printing(make, "make[1]: *** No rule to make target `test'.  Stop."), OwnTestsOutcome::Failed, "a make it runs is a failure");
         std::fs::write(d.path().join("package.json"), r#"{"scripts":{"test":"npm test --workspaces"}}"#).unwrap();
-        assert!(!printing(node, "npm error Missing script: \"test\""), "one package of several, maybe beside a real failure");
-        assert!(!printing(node, "npm error Missing script: \"verify\""), "a script its tests call is a failure");
+        assert_eq!(printing(node, "npm error Missing script: \"test\""), OwnTestsOutcome::Failed, "one package of several, maybe beside a real failure");
+        assert_eq!(printing(node, "npm error Missing script: \"verify\""), OwnTestsOutcome::Failed, "a script its tests call is a failure");
     }
 
     #[test]
@@ -445,8 +460,8 @@ func TestAnswer(t *testing.T) {
         let node = stacks::Toolchain { test: vec!["no-such-program-here".into()], windows_program: None, ..table.clone() };
         for json in [r#"{"name":"x"}"#, r#"{"scripts":{"test":"echo \"Error: no test specified\" && exit 1"}}"#] {
             std::fs::write(d.path().join("package.json"), json).unwrap();
-            let (passed, note) = own_tests_check(d.path(), Some(&node), &stop, &[]).unwrap();
-            assert!(passed && note.starts_with("No tests ran"), "nothing is started: {note}");
+            let (outcome, note) = own_tests_check(d.path(), Some(&node), &stop, &[]).unwrap();
+            assert!(outcome == OwnTestsOutcome::Skipped && note.starts_with("No tests ran"), "nothing is started: {note}");
         }
         let real = r#"{"scripts":{"test":"jest && echo 'no test specified for integration'"}}"#;
         std::fs::write(d.path().join("package.json"), real).unwrap();
@@ -484,7 +499,7 @@ func TestAnswer(t *testing.T) {
         let tool = stand_in(r#"test "$CRAFT_PROBE" = given"#, &[]);
         let env = [("CRAFT_PROBE", OsStr::new("given"))];
         assert!(own_build(d.path(), &tool, &stop, &env).unwrap().0);
-        assert!(own_tests_check(d.path(), Some(&tool), &stop, &env).unwrap().0);
+        assert_eq!(own_tests_check(d.path(), Some(&tool), &stop, &env).unwrap().0, OwnTestsOutcome::Passed);
         assert!(!own_build(d.path(), &tool, &stop, &[]).unwrap().0, "nothing is set without being given");
     }
 
