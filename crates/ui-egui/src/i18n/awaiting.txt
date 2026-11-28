@@ -60,3 +60,12 @@ Chat AI
 Use for chat
 Builder for a new run: {name}
 No builder available for a new run.
+Builds aren't counted while this record can't be read.
+Set it aside and count again
+Moves usage.json aside as usage.unreadable.json in the project folder and starts a new record. Builds from now on are counted; earlier ones aren't included.
+Count the usage again
+Set aside as usage.unreadable.json. Builds are counted again from now.
+Couldn't set the usage record aside.
+at least {n}
+Counted again since an unreadable usage record was set aside (usage.unreadable.json): earlier builds aren't included.
+Count a project's usage again

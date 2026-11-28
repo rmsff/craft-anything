@@ -45,6 +45,10 @@ pub struct ArgsCx<'a> {
     /// Where the message was written, for an adapter that [reads it from a file](AgentAdapter::reads_message_file);
     /// None over SSH, or when the file couldn't be written, and the message goes in argv.
     pub message_file: Option<&'a Path>,
+    /// Where an adapter that [writes its own files for a run](AgentAdapter::run_files) puts them:
+    /// a folder of that run's own, which the caller deletes when the run is over. `None`: this
+    /// run keeps nothing, or the folder couldn't be made.
+    pub run_dir: Option<&'a Path>,
 }
 
 /// One way of driving an agent CLI.
@@ -205,6 +209,13 @@ pub trait AgentAdapter: Send + Sync {
     /// [`ArgsCx::message_file`], for an agent that reads one but not stdin: a long one passes
     /// Windows' command-line limit too (#402).
     fn reads_message_file(&self) -> bool {
+        false
+    }
+    /// Whether a run of this adapter writes files of its own that must not outlive it: a tool
+    /// server given as a config file, or an overlay carrying the chosen model. When true, the
+    /// runner makes a private folder for the run and deletes it when the run is over — a stopped
+    /// run included — and hands its path over as [`ArgsCx::run_dir`]. `false`: nothing is written.
+    fn run_files(&self) -> bool {
         false
     }
     /// What goes in on stdin when [`prompt_on_stdin`](AgentAdapter::prompt_on_stdin) says so:

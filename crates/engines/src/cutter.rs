@@ -119,32 +119,50 @@ mod tests {
         stand_in_observing_reads(body, None)
     }
 
+    /// Serves connections until one request is answered: a call made again (after an interrupted
+    /// one) leaves its first connection behind, so one that goes away unanswered is skipped. One
+    /// deadline covers every connection, so a request that never completes still fails the test.
     fn stand_in_observing_reads(body: &'static str, waiting_for_read: Option<mpsc::Sender<usize>>) -> (u16, std::thread::JoinHandle<String>) {
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = l.local_addr().unwrap().port();
         let h = std::thread::spawn(move || {
-            let (mut s, _) = l.accept().unwrap();
-            s.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
-            let deadline = std::time::Instant::now() + Duration::from_secs(3);
-            let mut buf = [0u8; 4096];
-            let mut head = Vec::new();
-            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
-                let left = deadline.saturating_duration_since(std::time::Instant::now());
-                assert!(!left.is_zero(), "the fixture request did not complete in time");
-                s.set_read_timeout(Some(left)).unwrap();
-                if let Some(waiting) = &waiting_for_read {
-                    waiting.send(head.len()).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                let (mut s, _) = l.accept().unwrap();
+                let Some(head) = read_head(&mut s, deadline, waiting_for_read.as_ref()) else { continue };
+                let req = String::from_utf8_lossy(&head).lines().next().unwrap_or("").to_string();
+                let answer = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                if s.set_write_timeout(Some(Duration::from_secs(3))).is_ok() && s.write_all(answer.as_bytes()).is_ok() {
+                    return req;
                 }
-                let n = s.read(&mut buf).unwrap();
-                assert_ne!(n, 0, "the request ended before its headers were complete");
-                head.extend_from_slice(&buf[..n]);
-                assert!(head.len() <= 16 * 1024, "the fixture request exceeded its header limit");
             }
-            let req = String::from_utf8_lossy(&head).lines().next().unwrap_or("").to_string();
-            write!(s, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
-            req
         });
         (port, h)
+    }
+
+    /// Reads one request's headers, or `None` when the client goes away first. Panics on the
+    /// deadline or the 16 KiB header limit.
+    fn read_head(s: &mut TcpStream, deadline: Instant, waiting_for_read: Option<&mpsc::Sender<usize>>) -> Option<Vec<u8>> {
+        let mut buf = [0u8; 4096];
+        let mut head = Vec::new();
+        while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+            let left = deadline.saturating_duration_since(Instant::now());
+            assert!(!left.is_zero(), "the fixture request did not complete in time");
+            // Setting an option on a socket the peer has reset fails on macOS: that client is gone.
+            s.set_read_timeout(Some(left)).ok()?;
+            if let Some(waiting) = waiting_for_read {
+                waiting.send(head.len()).unwrap();
+            }
+            match s.read(&mut buf) {
+                Ok(0) => return None,
+                Ok(n) => head.extend_from_slice(&buf[..n]),
+                Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => panic!("the fixture request did not complete in time: {e}"),
+                Err(_) => return None,
+            }
+            assert!(head.len() <= 16 * 1024, "the fixture request exceeded its header limit");
+        }
+        Some(head)
     }
 
     #[test]
@@ -181,6 +199,18 @@ mod tests {
         client.read_to_string(&mut response).unwrap();
         assert_eq!(h.join().unwrap(), "GET /cmd/ij HTTP/1.1");
         assert_eq!(response, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+    }
+
+    #[test]
+    fn the_stand_in_answers_a_call_made_again() {
+        let (port, h) = stand_in("again");
+        // What an interrupted first call leaves: a connection that goes away before it is answered.
+        let mut dropped = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        dropped.write_all(b"GET /cmd/first HTTP/1.1\r\nHost: 127.0.0.1\r\n").unwrap();
+        drop(dropped);
+        let (text, cut) = command(port, "second", Duration::from_secs(5)).unwrap();
+        assert_eq!((text.as_str(), cut), ("again", false));
+        assert_eq!(h.join().unwrap(), "GET /cmd/second HTTP/1.1");
     }
 
     #[test]

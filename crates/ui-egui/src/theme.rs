@@ -531,6 +531,9 @@ const SCROLL_THUMB_AT_REST: f32 = 0.5;
 /// two or three turns for what a browser scrolls in one; it still eases to the new place.
 pub const WHEEL_STEP: f32 = 100.0;
 
+/// The default Project prompt viewport cap in a short pane, in points.
+pub const PROMPT_VIEWPORT_FLOOR: f32 = 208.0;
+
 /// Apply a theme: its colours, and the one set of text sizes and spacing both modes use.
 pub fn apply(ctx: &egui::Context, kind: ThemeKind) {
     let t = Tokens::for_kind(kind);

@@ -1148,6 +1148,7 @@ impl CraftApp {
             ("project_play", Ok(_)) => self.toast(tr("Starting… it opens in its own window."), false),
             ("project_play", Err(e)) => self.toast(format!("{} {}", tr("Couldn't start it."), e.for_people()), true),
             ("project_assets_budget" | "project_assets_allow", Ok(_)) => self.assets_changed(),
+            (craft_anything_engine::tools::project_tools::USAGE_RESET_TOOL, r) => self.usage_reset(r),
             ("rebuild_question_ask", r) => self.question_done(r),
             ("project_build_finish", Ok(v)) => {
                 if let Some(ws) = self.workspace.as_mut().filter(|w| v["project"].as_str().is_some_and(|p| w.root == std::path::Path::new(p))) {

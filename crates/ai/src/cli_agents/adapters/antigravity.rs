@@ -134,6 +134,7 @@ mod tests {
             reads_checked: false,
             question: false,
             message_file: None,
+            run_dir: None,
         })
     }
 

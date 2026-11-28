@@ -28,7 +28,8 @@ impl ProjectClock {
         clock
     }
 
-    fn read(&mut self, root: &Path) {
+    /// Read the record again, keeping a running build's clock going.
+    pub(crate) fn read(&mut self, root: &Path) {
         let read = ProjectUsage::read(root);
         self.unreadable = read.is_unreadable();
         self.saved = read.known().unwrap_or_default();
@@ -49,20 +50,35 @@ impl ProjectClock {
         Duration::from_millis(self.saved.work_ms) + self.since.map_or(Duration::ZERO, |s| s.elapsed())
     }
 
-    /// Whether there's anything to show: time, use, or a record that couldn't be read.
+    /// Whether there's anything to show: time, use, or a record that couldn't be read or was
+    /// started again.
     pub fn shown(&self) -> bool {
-        self.unreadable || self.working() || !self.elapsed().is_zero()
+        self.unreadable || self.saved.restarted || self.working() || !self.elapsed().is_zero()
     }
 
-    /// "12m 05s", or "Unknown" when the record couldn't be read.
+    /// "12m 05s", or "Unknown" when the record couldn't be read. A record started again counts
+    /// only part of the time: "at least 12m 05s".
     pub fn time_words(&self) -> String {
-        if self.unreadable { tr("Unknown") } else { duration_words(self.elapsed()) }
+        let elapsed = self.elapsed();
+        match (self.unreadable, self.saved.restarted) {
+            (true, _) => tr("Unknown"),
+            (false, true) if elapsed.is_zero() => tr("Unknown"),
+            (false, true) => trf("at least {n}", &[("n", &duration_words(elapsed))]),
+            (false, false) => duration_words(elapsed),
+        }
     }
 
-    /// The cost row, if there's one to show. An unreadable record is an unknown cost, never $0.
+    /// The cost row, if there's one to show. An unreadable record is an unknown cost, never $0,
+    /// and one started again is a lower bound.
     pub fn cost(&self) -> Option<CostStat> {
         if self.unreadable {
             return Some(CostStat { label: "AI cost", value: tr("Unknown"), note: None });
+        }
+        if self.saved.restarted {
+            // Rounded down: a lower bound rounded up could be more than was spent.
+            let cents = (self.saved.cost_usd * 100.0 + 1e-9).floor() / 100.0;
+            let value = if self.saved.priced { trf("at least {n}", &[("n", &format!("${cents:.2}"))]) } else { tr("Unknown") };
+            return Some(CostStat { value, ..cost_stat(&self.saved) });
         }
         self.saved.priced.then(|| cost_stat(&self.saved))
     }
@@ -80,7 +96,12 @@ impl ProjectClock {
         if self.unreadable {
             return tr("This project's usage record couldn't be read, so what its builds spent isn't known.");
         }
-        explain(&self.saved, counts)
+        let mut words = explain(&self.saved, counts);
+        if self.saved.restarted {
+            words.push('\n');
+            words.push_str(&tr("Counted again since an unreadable usage record was set aside (usage.unreadable.json): earlier builds aren't included."));
+        }
+        words
     }
 }
 
@@ -260,6 +281,32 @@ mod tests {
         c.saved_again(dir.path(), false);
         assert!(!c.unreadable);
         assert_eq!(c.cost().unwrap().value, "about $1.50");
+    }
+
+    /// R5.3: once an unreadable record is set aside, its figures are lower bounds, never the whole.
+    #[test]
+    fn a_record_counted_again_shows_lower_bounds() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(craft_anything_engine::workspace::USAGE_FILE), b"{ not json").unwrap();
+        let mut c = ProjectClock::load(dir.path());
+        ProjectUsage::reset(dir.path()).unwrap();
+        c.saved_again(dir.path(), false);
+        assert!(!c.unreadable && c.shown(), "still shown before the next build");
+        assert_eq!((c.time_words(), c.cost().unwrap().value, c.tokens()), ("Unknown".to_string(), "Unknown".to_string(), Some("Unknown".to_string())));
+
+        ProjectUsage::update(dir.path(), |u| {
+            u.work_ms = 725_000;
+            u.add_turn(17, 0, Some(0.4), false);
+        })
+        .unwrap();
+        c.saved_again(dir.path(), false);
+        assert_eq!(c.time_words(), "at least 12m 05s");
+        assert_eq!(c.cost().unwrap(), CostStat { label: "AI cost", value: "at least $0.40".into(), note: None });
+        ProjectUsage::update(dir.path(), |u| u.add_turn(0, 0, Some(0.006), false)).unwrap();
+        c.saved_again(dir.path(), false);
+        assert_eq!(c.cost().unwrap().value, "at least $0.40", "a lower bound isn't rounded up");
+        assert_eq!(c.tokens().as_deref(), Some("17+"));
+        assert!(c.explain("x").contains("earlier builds aren't included"), "{}", c.explain("x"));
     }
 
     #[test]

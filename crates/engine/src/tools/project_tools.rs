@@ -5,7 +5,7 @@
 use crate::feed;
 use crate::inbox::{Answer, Inbox};
 use crate::tool::{Ctx, Effects, Requires, ToolOutput, ToolSpec, Toolset, parse_params, schema_of};
-use crate::workspace::{ACTION_KINDS, ActionKind, Approval, USAGE_FILE, Workspace};
+use crate::workspace::{ACTION_KINDS, ActionKind, Approval, ProjectUsage, USAGE_FILE, Workspace};
 use craft_anything_evidence::{ErrorCode, ToolError};
 use craft_anything_platform::sync::Mutex;
 use schemars::JsonSchema;
@@ -14,6 +14,9 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, PoisonError};
+
+/// Sets an unreadable usage.json aside and starts counting again.
+pub const USAGE_RESET_TOOL: &str = "project_usage_reset";
 
 /// Most feed items one call returns.
 const MAX_ITEMS: usize = 200;
@@ -185,7 +188,32 @@ pub fn specs() -> Vec<ToolSpec> {
             input_schema: schema_of::<AllowAssetsParams>,
             run: project_assets_allow,
         },
+        ToolSpec {
+            id: USAGE_RESET_TOOL,
+            title: "Count a project's usage again",
+            summary: "When a project's usage.json can't be read (project_show says `usage_unreadable`), no run can add to it, so nothing more is counted. This moves it aside as usage.unreadable.json, kept in the project folder, and starts a new record: later runs are counted again, and the new figures leave out what came before (`restarted`). A readable usage.json is never replaced.",
+            beginner: "Starts counting a project's AI use again when its record is broken.",
+            toolset: Toolset::Projects,
+            effects: Effects::WRITES_FILESYSTEM,
+            requires: Requires::Nothing,
+            input_schema: schema_of::<UsageResetParams>,
+            run: project_usage_reset,
+        },
     ]
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UsageResetParams {
+    /// The project's folder.
+    pub project: PathBuf,
+}
+
+fn project_usage_reset(_ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError> {
+    let p: UsageResetParams = parse_params(params)?;
+    let ws = open(&p.project)?;
+    let aside = ProjectUsage::reset(&ws.root)?;
+    Ok(ToolOutput::Value(json!({"project": ws.root.display().to_string(), "set_aside": aside.display().to_string(), "usage": ws.usage().known()})))
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -557,7 +585,10 @@ fn summary(ws: &Workspace) -> Value {
         "usage_unreadable": usage_unreadable,
     });
     if usage_unreadable && let Some(o) = out.as_object_mut() {
-        o.insert("usage_note".into(), json!(format!("The project's {USAGE_FILE} couldn't be read, so what its builds used and spent isn't known.")));
+        o.insert(
+            "usage_note".into(),
+            json!(format!("The project's {USAGE_FILE} couldn't be read, so what its builds used and spent isn't known, and no run adds to it. {USAGE_RESET_TOOL} sets it aside and starts counting again.")),
+        );
     }
     out
 }
@@ -756,6 +787,17 @@ mod tests {
         assert!(bad["usage_note"].as_str().unwrap().contains("isn't known"));
         let list = e.call("project_list", json!({"projects_dir": d.path()}), CallOptions::new(Caller::Cli)).unwrap().to_json();
         assert_eq!(list["result"]["projects"][0]["usage_unreadable"], true);
+
+        assert!(bad["usage_note"].as_str().unwrap().contains(USAGE_RESET_TOOL));
+
+        // Set aside, it's counted again, and said to leave out what came before.
+        let reset = e.call(USAGE_RESET_TOOL, json!({"project": ws.root}), CallOptions::new(Caller::Cli)).unwrap().to_json()["result"].clone();
+        assert_eq!(reset["usage"]["restarted"], true, "{reset}");
+        assert!(ws.root.join(crate::workspace::USAGE_SET_ASIDE).is_file());
+        let counted = show();
+        assert_eq!((counted["usage_unreadable"].clone(), counted["usage"]["restarted"].clone()), (json!(false), json!(true)), "{counted}");
+        let readable = e.call(USAGE_RESET_TOOL, json!({"project": ws.root}), CallOptions::new(Caller::Cli)).unwrap_err();
+        assert!(readable.message.contains("can be read"), "{readable:?}");
 
         std::fs::write(ws.root.join(USAGE_FILE), br#"{"version":1,"cost_usd":2.5,"priced":true}"#).unwrap();
         let known = show();
