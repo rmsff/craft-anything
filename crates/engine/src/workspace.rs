@@ -1857,7 +1857,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         std::fs::write(root.join(USAGE_FILE), b"{ not json").unwrap();
-        std::fs::hard_link(root.join(USAGE_FILE), root.join(USAGE_SET_ASIDE)).unwrap();
+        // A copy, not a link, so the test runs on a drive without hard links too.
+        std::fs::write(root.join(USAGE_SET_ASIDE), b"{ not json").unwrap();
         assert_eq!(ProjectUsage::reset(root).unwrap(), root.join(USAGE_SET_ASIDE));
         let fresh = ProjectUsage::read(root).known().unwrap();
         assert!(fresh.restarted && fresh.tokens_incomplete, "{fresh:?}");
