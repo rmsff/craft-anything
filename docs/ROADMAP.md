@@ -370,6 +370,11 @@ only when it's green and a maintainer has fully reviewed it, code as well as wor
       time limit, through `platform::retry::when_interrupted`); the Cutter command tool, whose
       commands can change the session, calls once and says the call was interrupted
       — claimed: tanish2k09, branch bugfix/r5.2-interrupted-loopback-call
+- [x] The Cutter tests' stand-in session answers only one connection, so when a signal interrupts
+      the first call and `cutter::command` calls again, the stand-in writes to the dropped
+      connection and panics (BrokenPipe) and the repeated call is reset (CI run 45366943275);
+      serve connections until one request is answered, and test a dropped first call
+      — claimed: tanish2k09, branch test/r5.2-cutter-stand-in-repeated-call
 - [x] `mcp_client.rs`'s `post` reports an interrupted call (EINTR) as "Couldn't reach the plugin"
       (`EngineMissing`); a JSON-RPC POST isn't safe to send again, so say it was interrupted instead
       — claimed: Afloat16, branch bugfix/r5.2-mcp-interrupted-post
@@ -423,9 +428,19 @@ Every round spends the person's money or quota. One that can't do anything shoul
       missing file, bad JSON, an empty file, a folder, an oversized file, no read permission (Unix),
       a valid file, the tool result and the screen's words
       — claimed: tanish2k09, branch bugfix/r5.3-unreadable-usage
-- [ ] An unreadable `usage.json` now stops a project's usage from being counted at all (every
-      update is refused and logged). Say so where the person can act on it, for example offer to
-      set the file aside and start counting again
+- [x] An unreadable `usage.json` stopped a project's usage from being counted at all (every
+      update was refused and logged). The project screen now says builds aren't counted while it
+      can't be read and offers "Set it aside and count again" (`project_usage_reset`, also named
+      by `project_show`'s `usage_note` and the refused update's remediation): the file is kept as
+      `usage.unreadable.json`, a new record counts later runs, and it is marked `restarted`, so
+      its time and cost show as "at least …" and its tokens as a lower bound, never as the whole.
+      A readable record, or one already set aside, is never replaced. Unit tests of the move, the
+      tool and the screen's words
+      — PR #2212; claimed: rmsff, branch bugfix/r5.3-unreadable-usage-json
+- [ ] A record started again stays `usage.json` version 1, where a missing `restarted` reads as
+      false, so an older build that updates it drops the field and its figures stop showing as
+      "at least …". Make it version 2, with a step that adds `restarted: false` to a version 1
+      file, so an older build refuses the record instead (`USAGE_VERSION`; #2212 review)
 - [x] Show what the last run used next to Try again. `usage.json` keeps project totals only
       (time, tokens, `cost_usd`, `api_billed_usd`); the activity log has each turn's tokens but
       no cost, since a resumed agent's figure can't be tied to one turn (`activity.rs`). Show
@@ -1613,6 +1628,18 @@ Owner: open · Status: in progress
       — claimed: gtxy27, branch `bugfix/r2.2-dsh-stdin`
 - [ ] DeepSeek Harness: no resume (its headless profile keeps no session), and a build on the harness's
       desktop profile is untried
+- [x] DeepSeek Harness: offer the models the person already set up in the desktop app, so Settings → AI
+      can choose one instead of only the harness's own default. The list comes from the desktop
+      profile's provider patch layer (`$DSH_HOME/profiles/desktop/cordis.patch.yml`) plus the models
+      every harness ships with; a chosen model travels in the same generated `--patch` overlay as our
+      tool server, which also brings those provider settings along and turns the key store back on
+      (the headless bundle leaves it off, so a key saved in the app was never seen: that is the
+      `MISSING_CREDENTIAL` a desktop-profile model run used to stop with). The harness has no
+      `--model` flag, so the overlay is the only route. The overlay lives in a folder of the run's
+      own and is removed with it, a stopped run included, so a key written inline in the desktop
+      profile is not left behind. Verified with adapter, model-list and overlay tests and live turns
+      on the desktop profile's own providers (DSH 0.2.2-rc.5).
+      — claimed: Walker-HK, branch feature/r2.2-dsh-model-choice
 - [x] Apply repeated client selections and aliases once, preserving their first selection order.
       — claimed: Plastic-time, branch rrfz/bugfix-r2.2-deduplicate-clients
 - [ ] `setup` writes the plain `mcp` command, so it drops an `--all-tools` an entry already has, and
@@ -1843,6 +1870,9 @@ Gaps found while using the app for real projects.
       — PR #2217; claimed: rmsff, branch feature/r2.9-plugin-form-checks
 - [ ] A plugin's Test lists its tools but calls none, and #2153 met a server that listed 11 tools
       and failed on use. Offer an optional call of one tool the person picks, saying it runs it
+- [x] Let the prompt box grow with the draft and scroll internally only after it reaches its height limit
+      — claimed: bimgeek, branch bugfix/r2.9-prompt-box-sizing
+- [ ] Keep the Project controls visible when a tall pinned plan fills the smallest window, even with a short draft
 - [x] Each project chooses, per kind of action, what the builder's approvals get (allow, ask or
       refuse): reading the web, commands, files outside the project, pushing and publishing,
       deleting outside the project, system changes, other tools. Unset kinds follow Auto mode as
@@ -2167,6 +2197,9 @@ Gaps found while using the app for real projects.
       switcher in every README (#831)
 - [x] A Thai README (`README.th.md`) translated from `README.md` and linked from the language
       switcher in every README
+- [x] An Italian README (`README.it.md`) translated from `README.md`, with English technical
+      terminology and links from every README language switcher (#2173)
+      — claimed: arloo, branch docs/italian-translation
 - [ ] Vietnamese letters with stacked marks (ạ ả ấ ế ơ ư ữ…) aren't in the bundled Figtree or egui's
       default fonts: without craft-fonts they show as boxes, and with it each such letter comes from
       Noto Sans CJK while the rest of the word is Figtree. Bundle a build of the text font that has the
@@ -2465,7 +2498,13 @@ to the project next.
       — in PR #220
 - [ ] Pins of one project sharing with each other, so a third frozen copy of the same assets
       takes no more space
-- [ ] Pin a website (a frozen copy of the built site, each served on its own port)
+- [x] Pin a website (a frozen copy of the built site, each served on its own port): a pin copies
+      the built site alone (a light one shares its media), and opening it serves that copy on a
+      free loopback port of its own until it's closed; a served pin isn't removed
+      (`a_pinned_website_is_served_from_its_copy_on_a_port_of_its_own`)
+      — in PR #2239
+- [ ] A pinned website keeps one address: each open takes a free port, so what the browser keeps
+      for a site (its storage, a sign-in) doesn't carry over to the next time it's opened
 - [ ] A pin started before the app restarted shows as running (keep its process id and start
       time in the pin, and check both), and can be stopped
 - [x] Cap a run's log (`last-run.log`, `play.log`): it grows as long as the program prints. The

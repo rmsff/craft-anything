@@ -255,6 +255,11 @@ test's child ending) during a loopback call, and every error that wasn't a timeo
 session". An interrupted system call is not an answer: decide on the error's typed kind
 (`ErrorKind::Interrupted`), call again within the same time limit when the request is safe to
 repeat (`platform::retry::when_interrupted`), and otherwise say it was interrupted.
+The fix then failed the same test in another way: its stand-in session took one connection and
+panicked on any error, so when an interrupted first call was dropped and made again, the stand-in
+failed writing to the dropped one (BrokenPipe), its listener closed and the second call was reset.
+When a client learns to call again, every stand-in it talks to must take the repeated call: serve
+connections until one request is answered, and test a first call dropped part-way.
 
 **A stand-in server that answers every request in order.** The AI tests' `mock` answered each
 request with the next scripted reply, so when the agent began asking the server for its context

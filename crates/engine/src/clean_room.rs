@@ -55,6 +55,7 @@ pub const TOOLS: &[&str] = &[
     "project_open_folder",
     "project_assets_budget",
     "project_assets_allow",
+    "project_usage_reset",
     "project_rename",
     "project_duplicate",
     "project_delete",

@@ -14,6 +14,7 @@ use craft_anything_ai::rebuild::feed::{self, apply};
 use craft_anything_ai::rebuild::{self, AppKind, KindRegistry, KindWords, Note, RebuildRun, RunEvent, RunOptions, Started, Step, Stopped, TargetKind};
 use craft_anything_engine::inbox::{Answer, Inbox, Request, RequestKind};
 use craft_anything_engine::outputs::CargoEnv;
+use craft_anything_engine::tools::project_tools::USAGE_RESET_TOOL;
 use craft_anything_engine::workspace::{CheckResult, Status, TargetRef, Workspace, suggest_name};
 use egui::{Color32, RichText, Ui, Vec2};
 use std::path::{Path, PathBuf};
@@ -862,6 +863,31 @@ impl CraftApp {
         self.act("project_assets_budget", params, tr("Raise the asset budget"));
     }
 
+    /// Set a project's unreadable usage record aside so its builds are counted again, through the
+    /// project_usage_reset tool.
+    fn reset_usage(&mut self, root: &Path) {
+        self.act(USAGE_RESET_TOOL, serde_json::json!({"project": root}), tr("Count the usage again"));
+    }
+
+    /// After project_usage_reset: read the new record, or say why it wasn't set aside.
+    pub(crate) fn usage_reset(&mut self, result: Result<serde_json::Value, craft_anything_engine::evidence::ToolError>) {
+        match result {
+            Ok(v) => {
+                if let Some(root) = v["project"].as_str().map(PathBuf::from)
+                    && let Some(clock) = self.usage.get_mut(&root)
+                {
+                    // Only the record is read again: a running build's clock goes on from its start.
+                    clock.read(&root);
+                }
+                self.toast(tr("Set aside as usage.unreadable.json. Builds are counted again from now."), false);
+            }
+            Err(e) => {
+                let why = tr("Couldn't set the usage record aside.");
+                self.toast(format!("{why} {}", e.for_people()), true);
+            }
+        }
+    }
+
     /// After project_assets_budget or project_assets_allow: show the project's new settings.
     pub(crate) fn assets_changed(&mut self) {
         if let Some(ws) = self.workspace.as_mut() {
@@ -939,10 +965,16 @@ pub fn show(app: &mut CraftApp, ui: &mut Ui) {
         // is measured each frame and used on the next. It keeps a few lines even when a tall
         // composer needs the room, and the composer scrolls instead.
         let comp_id = ui.id().with("project-composer-h");
+        let text_id = comp_id.with("text-height");
         let comp_h = ui.data(|d| d.get_temp::<f32>(comp_id)).unwrap_or(110.0);
+        let text_h = ui.data(|d| d.get_temp::<f32>(text_id)).unwrap_or_default();
         let available = ui.available_height().max(0.0);
         let min_feed = MIN_FEED_HEIGHT.min(available * 0.5);
-        let feed_h = (available - comp_h - chat::COMPOSER_GAP - ui.spacing().item_spacing.y).max(min_feed);
+        let room_for_feed_and_composer = available - chat::COMPOSER_GAP - ui.spacing().item_spacing.y;
+        // Pinned plans, picture tiles and controls share the same height as the draft. Use
+        // their measured height so a draft cannot grow into space they already occupy.
+        let text_limit = room_for_feed_and_composer - min_feed - (comp_h - text_h);
+        let feed_h = (room_for_feed_and_composer - comp_h).max(min_feed);
         let rest = Vec2::new(width, feed_h);
         let feed_area = ui.allocate_ui_with_layout(rest, egui::Layout::top_down(egui::Align::Min), |ui| {
             ui.set_min_height(rest.y);
@@ -968,12 +1000,17 @@ pub fn show(app: &mut CraftApp, ui: &mut Ui) {
         let r = egui::ScrollArea::vertical().id_salt("project-composer").min_scrolled_height(0.0).max_height(room).auto_shrink([false, true]).show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.add_space(pad);
-                ui.vertical(|ui| composer(app, ui, max_w, &t, waiting.last()));
+                ui.vertical(|ui| composer(app, ui, max_w, &t, waiting.last(), available, text_limit)).inner
             })
+            .inner
         });
+        if (text_h - r.inner).abs() > 0.5 {
+            ui.ctx().request_discard("the project draft changed height");
+        }
         chat::remember_composer_height(ui, comp_id, comp_h, r.content_size.y);
         // The layout regressions check the composer's own viewport, not only the window.
         ui.data_mut(|d| {
+            d.insert_temp(text_id, r.inner);
             d.insert_temp(egui::Id::new("project-feed-height"), feed_area.inner.inner_rect.height());
             d.insert_temp(egui::Id::new("project-composer-clip"), r.inner_rect);
             d.insert_temp(egui::Id::new("project-composer-content"), r.content_size.y);
@@ -1013,7 +1050,9 @@ fn side(app: &mut CraftApp, ui: &mut Ui, ws: &Workspace) {
         outcome_button(app, ui, ws, theme::ControlSize::Medium, true);
     }
     ui.add_space(theme::space::LG);
-    steps(app, ui, ws);
+    if steps(app, ui, ws) {
+        app.reset_usage(&ws.root);
+    }
     ui.add_space(theme::space::LG);
     open_questions(app, ui);
     if craft_anything_engines::game::Builder::from_stack(&m.stack).is_some() {
@@ -1047,7 +1086,10 @@ fn side(app: &mut CraftApp, ui: &mut Ui, ws: &Workspace) {
         if widgets::action_row(ui, "folder-open", "Open folder", false).clicked() {
             open_folder(app, ws);
         }
-        if matches!(outcome(app), Some(Outcome::Program))
+        // Not mid-build, so a website's copy isn't taken half-made; only a build there is to pin
+        // (a preview still being served isn't one).
+        if !app.running()
+            && (app.facts.site || app.facts.program)
             && widgets::action_row(ui, "pin", "Pin this build", false).on_hover_text(tr("Keep this version in the sidebar to open any time.")).clicked()
         {
             app.ask_pin(&ws.root);
@@ -1130,8 +1172,11 @@ fn open_questions(app: &CraftApp, ui: &mut Ui) {
     ui.add_space(theme::space::LG);
 }
 
-fn steps(app: &CraftApp, ui: &mut Ui, ws: &Workspace) {
+/// The project's progress and usage; true when the person asked to set an unreadable usage
+/// record aside.
+fn steps(app: &CraftApp, ui: &mut Ui, ws: &Workspace) -> bool {
     let t = Tokens::get(ui.ctx());
+    let mut reset_usage = false;
     let current = current_step(app, ws);
     let live = current.is_some_and(|(_, live)| live);
     let idx = current.and_then(|(c, _)| Step::ALL.iter().position(|s| *s == c));
@@ -1236,6 +1281,21 @@ fn steps(app: &CraftApp, ui: &mut Ui, ws: &Workspace) {
             if let Some(usage) = u.tokens() {
                 widgets::stat_row(ui, "Tokens", &usage).on_hover_text(tip());
             }
+            // Said where it can be fixed: until then no run adds to the record.
+            if u.unreadable {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(tr("Builds aren't counted while this record can't be read."))
+                            .color(t.text_faint)
+                            .size(theme::CAPTION)
+                            .line_height(Some(theme::leading(theme::CAPTION))),
+                    )
+                    .wrap(),
+                );
+                reset_usage = widgets::link(ui, &tr("Set it aside and count again")).on_hover_text(tr(
+                    "Moves usage.json aside as usage.unreadable.json in the project folder and starts a new record. Builds from now on are counted; earlier ones aren't included.",
+                )).clicked();
+            }
             if u.working() {
                 ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
             }
@@ -1249,6 +1309,7 @@ fn steps(app: &CraftApp, ui: &mut Ui, ws: &Workspace) {
             ui.painter().rect_filled(filled, 2.0, t.accent);
         }
     });
+    reset_usage
 }
 
 fn feed(app: &mut CraftApp, ui: &mut Ui, ws: &Workspace, waiting: &[Note]) {
@@ -1887,7 +1948,7 @@ fn waiting_notes(app: &mut CraftApp, ui: &mut Ui, waiting: &[Note], t: &Tokens) 
     }
 }
 
-fn composer(app: &mut CraftApp, ui: &mut Ui, width: f32, t: &Tokens, last_waiting: Option<&Note>) {
+fn composer(app: &mut CraftApp, ui: &mut Ui, width: f32, t: &Tokens, last_waiting: Option<&Note>, pane_height: f32, text_limit: f32) -> f32 {
     let running = app.running();
     if let Some(steps) = plan(&app.state.feed).filter(|p| running || p.iter().any(|s| s.status != PlanStatus::Done)) {
         let began = app.open_run().filter(|_| running).map(RebuildRun::started);
@@ -1961,7 +2022,9 @@ fn composer(app: &mut CraftApp, ui: &mut Ui, width: f32, t: &Tokens, last_waitin
             prompt_box::PromptBox {
                 name: "Ask for a change",
                 hint,
-                rows: (1, 8),
+                min_rows: 2,
+                viewport_height: prompt_box::ViewportHeight::Pane(pane_height),
+                text_height_limit: Some(text_limit),
                 attach: Some("Attach pictures (or drop or paste them here)"),
                 previews: &previews,
                 // The one way to pause (Continue picks up where it stopped).
@@ -2009,7 +2072,9 @@ fn composer(app: &mut CraftApp, ui: &mut Ui, width: f32, t: &Tokens, last_waitin
             }
         }
         questions_switch(app, ui);
-    });
+        out.text_height
+    })
+    .inner
 }
 
 /// Send what's in the prompt box: a question (the switch, or /btw) is answered without building.
@@ -2442,6 +2507,24 @@ mod tests {
             assert_eq!(seen[1].0.as_deref(), Some(left.text.as_str()));
             assert_eq!(seen[1].1, [rebuild::notes::Carried { id, note: left }]);
         }
+    }
+
+    /// Counting again after a reset reads the new record but keeps a running build's clock.
+    #[test]
+    fn a_reset_keeps_a_running_builds_clock() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join(craft_anything_engine::workspace::USAGE_FILE), b"{ not json").unwrap();
+        let mut app = crate::demo::app(crate::demo::engine(craft_anything_engine::Mode::Beginner, true));
+        let mut clock = crate::usage::ProjectClock::load(d.path());
+        clock.saved_again(d.path(), true);
+        app.usage.insert(d.path().to_path_buf(), clock);
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let before = app.usage[d.path()].elapsed();
+        craft_anything_engine::workspace::ProjectUsage::reset(d.path()).unwrap();
+        app.usage_reset(Ok(serde_json::json!({"project": d.path()})));
+        let clock = &app.usage[d.path()];
+        assert!(clock.working() && !clock.unreadable, "the new record is read");
+        assert!(clock.elapsed() >= before, "the build's time so far isn't lost");
     }
 
     #[test]
