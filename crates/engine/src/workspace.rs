@@ -21,7 +21,7 @@ use crate::inbox::{next_counter, now_ms};
 use crate::project::write_atomic;
 use crate::versioned::{self, upgrade};
 use craft_anything_evidence::{ErrorCode, ToolError};
-use craft_anything_platform::fs::read_file_capped;
+use craft_anything_platform::fs::{open_regular_file, read_file_capped};
 use craft_anything_platform::sync::Mutex;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -646,12 +646,24 @@ fn usage_v1_to_v2(doc: &mut Value) -> Result<(), String> {
     Ok(())
 }
 
-/// Both are regular files with the same bytes. One too big to be a usage record reads as different.
+/// Both are regular files with the same bytes. They are compared a piece at a time, since a record
+/// too big to read as usage is unreadable too and may be set aside.
 fn same_bytes(a: &Path, b: &Path) -> bool {
-    match (read_file_capped(a, MAX_USAGE_BYTES), read_file_capped(b, MAX_USAGE_BYTES)) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => false,
+    use std::io::Read as _;
+    let (Ok((mut a, about_a)), Ok((mut b, about_b))) = (open_regular_file(a), open_regular_file(b)) else { return false };
+    if about_a.len() != about_b.len() {
+        return false;
     }
+    let (mut piece_a, mut piece_b) = (vec![0; 64 * 1024], vec![0; 64 * 1024]);
+    let mut left = about_a.len();
+    while left > 0 {
+        let n = usize::try_from(left).map_or(piece_a.len(), |left| left.min(piece_a.len()));
+        if a.read_exact(&mut piece_a[..n]).is_err() || b.read_exact(&mut piece_b[..n]).is_err() || piece_a[..n] != piece_b[..n] {
+            return false;
+        }
+        left -= n as u64;
+    }
+    true
 }
 
 /// Copy `from` into a new file `to`, created only where nothing is, so a file already there is
@@ -1850,6 +1862,19 @@ mod tests {
         let fresh = ProjectUsage::read(root).known().unwrap();
         assert!(fresh.restarted && fresh.tokens_incomplete, "{fresh:?}");
         assert_eq!(std::fs::read(root.join(USAGE_SET_ASIDE)).unwrap(), b"{ not json", "the set-aside record is kept as it was");
+    }
+
+    /// #2494 review: a record too big to read as usage compared as different from its own set-aside
+    /// copy, so a reset that stopped after setting it aside refused for good.
+    #[test]
+    fn a_stopped_reset_of_a_record_too_big_to_read_finishes_when_tried_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::File::create(root.join(USAGE_FILE)).unwrap().set_len(MAX_USAGE_BYTES + 1).unwrap();
+        std::fs::copy(root.join(USAGE_FILE), root.join(USAGE_SET_ASIDE)).unwrap();
+        assert_eq!(ProjectUsage::reset(root).unwrap(), root.join(USAGE_SET_ASIDE));
+        assert!(ProjectUsage::read(root).known().is_some_and(|u| u.restarted), "counting starts again");
+        assert!(std::fs::metadata(root.join(USAGE_SET_ASIDE)).unwrap().len() > MAX_USAGE_BYTES, "the set-aside record is kept");
     }
 
     /// #2212 review: without hard links, reset checked that nothing was set aside and then renamed
